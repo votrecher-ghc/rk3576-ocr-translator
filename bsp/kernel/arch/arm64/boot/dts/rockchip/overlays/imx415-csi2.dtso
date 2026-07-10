@@ -1,0 +1,133 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * imx415-csi2.dtso - IMX415摄像头CSI2 DTS Overlay
+ *
+ * 描述: IMX415摄像头传感器通过MIPI CSI2连接到RK3576。
+ *       使用csi2_dphy0数据通道，4-lane模式。
+ *       I2C控制总线: i2c4, 地址0x1a
+ *       复位引脚: GPIO3 PA6
+ *
+ * 作者: OCR Team <ocr@example.com>
+ * 许可证: GPL-2.0
+ */
+
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/pinctrl/rockchip.h>
+#include <dt-bindings/clock/rk3576-cru.h>
+
+/ {
+	compatible = "rockchip,rk3576";
+
+	/* 片上CSI/ISP节点引用 */
+	fragment@0 {
+		target = <&i2c4>;
+
+		__overlay__ {
+			status = "okay";
+
+			/* IMX415摄像头传感器 */
+			imx415: imx415@1a {
+				compatible = "sony,imx415";
+				reg = <0x1a>;
+
+				/* 时钟引用 */
+				clocks = <&cru CLK_MIPI_CAM_OUT>;
+				clock-names = "xvclk";
+
+				/* 供电配置 */
+				avdd-supply = <&vcc_2v8_s3>;
+				dovdd-supply = <&vcc_1v8_s3>;
+				dvdd-supply = <&vcc_1v2_s3>;
+
+				/* 复位引脚: GPIO3 PA6, 高电平有效 */
+				reset-gpios = <&gpio3 6 GPIO_ACTIVE_HIGH>;
+
+				/* 使能引脚（可选） */
+				enable-gpios = <&gpio0 12 GPIO_ACTIVE_HIGH>;
+
+				/* MIPI CSI2端口配置 */
+				port {
+					imx415_out: endpoint {
+						/* 连接到CSI2 DPHY */
+						remote-endpoint = <&csi2_dphy0_in>;
+						/* 4-lane模式 */
+						data-lanes = <1 2 3 4>;
+						/* 链路频率 */
+						link-frequencies = /bits/ 64 <594000000>;
+					};
+				};
+
+				status = "okay";
+			};
+		};
+	};
+
+	/* CSI2 DPHY配置 */
+	fragment@1 {
+		target = <&csi2_dphy0>;
+
+		__overlay__ {
+			status = "okay";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				/* DPHY输入端口（来自传感器） */
+				port@0 {
+					reg = <0>;
+
+					csi2_dphy0_in: endpoint {
+						remote-endpoint = <&imx415_out>;
+						data-lanes = <1 2 3 4>;
+					};
+				};
+
+				/* DPHY输出端口（到ISP/CSI控制器） */
+				port@1 {
+					reg = <1>;
+
+					csi2_dphy0_out: endpoint {
+						remote-endpoint = <&csi2_host0_in>;
+						data-lanes = <1 2 3 4>;
+					};
+				};
+			};
+		};
+	};
+
+	/* CSI2 Host控制器配置 */
+	fragment@2 {
+		target = <&csi2_host0>;
+
+		__overlay__ {
+			status = "okay";
+
+			port {
+				csi2_host0_in: endpoint {
+					remote-endpoint = <&csi2_dphy0_out>;
+					data-lanes = <1 2 3 4>;
+				};
+			};
+		};
+	};
+
+	/* ISP配置（可选，如需图像处理） */
+	fragment@3 {
+		target = <&rkcif_mipi_lvds>;
+
+		__overlay__ {
+			status = "okay";
+
+			port {
+				rkcif_mipi_in: endpoint {
+					remote-endpoint = <&csi2_host0_in>;
+					data-lanes = <1 2 3 4>;
+				};
+			};
+		};
+	};
+};

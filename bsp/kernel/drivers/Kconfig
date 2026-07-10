@@ -1,0 +1,89 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# OCR系统自研驱动 Kconfig
+#
+# 描述: RK3576鲁班猫3 OCR系统的5个自研内核驱动配置菜单
+#
+# 作者: OCR Team <ocr@example.com>
+# 许可证: GPL-2.0
+#
+
+menu "OCR System Drivers (RK3576 LubanCat3)"
+	depends on ARCH_ROCKCHIP || COMPILE_TEST
+
+config OCR_GPIO_KEYS
+	tristate "OCR GPIO Keys Driver"
+	depends on GPIOLIB && INPUT
+	select INPUT_POLLDEV if INPUT
+	help
+	  RK3576鲁班猫3 OCR系统的GPIO按键驱动。
+
+	  基于GPIO中断和消抖定时器实现按键检测，通过Input子系统
+	  上报KEY_CAMERA等按键事件。用于OCR系统的拍照触发。
+
+	  兼容字符串: "ocr,gpio-keys"
+
+	  编译为模块则选择M；编译进内核则选择Y；不使用则选择N。
+
+config IIO_AP3216C
+	tristate "AP3216C Ambient Light and Proximity Sensor (IIO)"
+	depends on I2C && IIO
+	help
+	  AP3216C环境光和接近传感器IIO驱动。
+
+	  通过I2C读取环境光(ALS)和接近(PS)数据，使用IIO子系统
+	  暴露给用户空间。支持中断模式（可选）。
+
+	  I2C地址: 0x1E
+	  兼容字符串: "ocr,ap3216c"
+
+	  编译为模块则选择M；编译进内核则选择Y；不使用则选择N。
+
+config IIO_ICM42688_SPI
+	tristate "ICM42688 6-Axis IMU Driver (SPI + IIO)"
+	depends on SPI && IIO
+	select IIO_BUFFER
+	select IIO_TRIGGERED_BUFFER
+	help
+	  ICM42688六轴惯性测量单元(I MU)SPI驱动。
+
+	  通过SPI全双工通信读取三轴加速度、三轴陀螺仪和温度数据，
+	  使用IIO triggered_buffer机制支持连续采样。
+
+	  SPI最大频率: 24MHz
+	  配置: ODR 1kHz, 加速度±4g, 陀螺仪±2000dps
+	  兼容字符串: "ocr,icm42688"
+
+	  编译为模块则选择M；编译进内核则选择Y；不使用则选择N。
+
+config IIO_ADT7410
+	tristate "ADT7410 Temperature Sensor Driver (I2C + IIO)"
+	depends on I2C && IIO
+	help
+	  ADT7410高精度温度传感器IIO驱动。
+
+	  通过I2C读取16位温度数据，分辨率0.0078°C/LSB。
+	  使用IIO子系统暴露温度通道给用户空间。
+
+	  I2C地址: 0x48
+	  兼容字符串: "ocr,adt7410"
+
+	  编译为模块则选择M；编译进内核则选择Y；不使用则选择N。
+
+config PWM_FAN_OCR
+	tristate "OCR PWM Fan Thermal Control Driver"
+	depends on PWM && HWMON
+	depends on IIO
+	help
+	  RK3576鲁班猫3 OCR系统PWM风扇温控驱动。
+
+	  基于PWM占空比控制风扇转速，结合分段温度阈值和回差
+	  (hysteresis)实现自动温控。通过hwmon子系统暴露温度和
+	  PWM信息。温度来源通过IIO通道读取ADT7410传感器。
+
+	  状态机: OFF → LOW → MID → HIGH（带回差防抖）
+	  兼容字符串: "ocr,pwm-fan"
+
+	  编译为模块则选择M；编译进内核则选择Y；不使用则选择N。
+
+endmenu

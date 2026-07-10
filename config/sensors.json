@@ -1,0 +1,57 @@
+{
+  "sensors": {
+    "ambient_light": {
+      "enabled": true,
+      "iio_device": "/sys/bus/iio/devices/iio:device0",
+      "channel": "in_illuminance_raw",
+      "scale": 0.01,
+      "poll_interval_ms": 1000,
+      "thresholds": {
+        "backlight_low": 50,
+        "backlight_mid": 200,
+        "backlight_high": 500
+      },
+      "backlight_map": {
+        "low": 60,
+        "mid": 150,
+        "high": 230
+      }
+    },
+    "temperature": {
+      "enabled": true,
+      "iio_device": "/sys/bus/iio/devices/iio:device1",
+      "channel": "in_temp_raw",
+      "scale": 0.001,
+      "poll_interval_ms": 1000,
+      "thresholds": {
+        "fan_off": 45,
+        "fan_low": 55,
+        "fan_mid": 65,
+        "fan_high": 75,
+        "thermal_throttle": 85,
+        "shutdown": 95
+      },
+      "fan_duty_map": {
+        "off": 0,
+        "low": 40,
+        "mid": 70,
+        "high": 100
+      },
+      "fan_period_ns": 100000
+    },
+    "humidity": {
+      "enabled": false,
+      "iio_device": "",
+      "channel": "in_humidityrelative_raw",
+      "scale": 0.001,
+      "poll_interval_ms": 5000
+    }
+  },
+  "safety": {
+    "enable_watchdog": true,
+    "watchdog_device": "/dev/watchdog",
+    "watchdog_timeout_s": 10,
+    "enable_thermal_shutdown": true,
+    "enable_overcurrent_detect": false
+  }
+}

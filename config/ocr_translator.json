@@ -1,0 +1,52 @@
+{
+  "app": {
+    "mode": "live",
+    "log_level": "info",
+    "log_file": "/var/log/ocr_translator.log"
+  },
+  "capture": {
+    "device": "/dev/video0",
+    "width": 1920,
+    "height": 1080,
+    "fps": 30,
+    "format": "NV12",
+    "buffer_count": 4
+  },
+  "display": {
+    "device": "/dev/dri/card0",
+    "plane_primary": 0,
+    "plane_overlay": 1,
+    "overlay_format": "XR24",
+    "display_width": 1920,
+    "display_height": 1080
+  },
+  "ai": {
+    "det_model": "/usr/share/ocr/models/ppocrv4_det_int8.rknn",
+    "rec_model": "/usr/share/ocr/models/ppocrv4_rec_fp16.rknn",
+    "trans_model": "/usr/share/ocr/models/lite_transformer_fp16.rknn",
+    "det_threshold": 0.3,
+    "rec_batch_size": 6,
+    "max_seq_len": 128,
+    "src_lang": "en",
+    "dst_lang": "zh"
+  },
+  "stab": {
+    "imu_device": "/dev/iio:device2",
+    "sample_rate": 500,
+    "crop_ratio": 0.9,
+    "filter_beta": 0.1,
+    "madgwick_beta": 0.1
+  },
+  "sensors": {
+    "light_poll_interval_ms": 1000,
+    "temp_poll_interval_ms": 1000,
+    "backlight_path": "/sys/class/backlight/panel-backlight/brightness",
+    "pwm_fan_path": "/sys/class/pwm/pwmchip11/pwm0/duty_cycle"
+  },
+  "archive": {
+    "base_dir": "/data/ocr",
+    "max_usage_pct": 90,
+    "max_entries": 1000,
+    "jpeg_quality": 90
+  }
+}

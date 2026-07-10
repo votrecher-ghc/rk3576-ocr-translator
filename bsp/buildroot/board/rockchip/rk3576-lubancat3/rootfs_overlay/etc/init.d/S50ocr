@@ -1,0 +1,178 @@
+#!/bin/sh
+# =====================================================================
+# S50ocr - OCR 翻译应用 SysV init 启动脚本
+# 位置: /etc/init.d/S50ocr
+# 功能: 启动 ocr_translator 应用, 设置 RT 调度优先级, 失败重启
+# =====================================================================
+
+# SysV init 标准头
+### BEGIN INIT INFO
+# Provides:          ocr_translator
+# Required-Start:    $remote_fs $network
+# Required-Stop:     $remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: OCR 翻译服务
+# Description:       启动 OCR 翻译实时应用 (V4L2 采集 + NPU 推理 + DRM 渲染)
+### END INIT INFO
+
+# ---------------------- 配置变量 ----------------------
+# 应用可执行文件路径
+APP_BIN="/usr/bin/ocr_translator"
+# 主配置文件
+CONFIG_FILE="/etc/ocr/ocr_translator.json"
+# 日志文件
+LOG_FILE="/var/log/ocr_translator.log"
+# PID 文件
+PID_FILE="/var/run/ocr_translator.pid"
+
+# RT 调度优先级 (1-99, 越高越优先)
+RT_PRIORITY=80
+# 失败重启间隔 (秒)
+RESTART_DELAY=3
+# 最大重启次数 (连续失败超过此次数后停止, 需人工干预)
+MAX_RESTARTS=5
+
+# 进程名称 (用于 pgrep)
+APP_NAME="ocr_translator"
+
+# ---------------------- 辅助函数 ----------------------
+log() {
+    echo "[S50ocr] $*"
+}
+
+# 获取运行中的 PID
+get_pid() {
+    if [ -f "${PID_FILE}" ]; then
+        local pid
+        pid=$(cat "${PID_FILE}" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "$pid"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# ---------------------- 启动应用 ----------------------
+start_app() {
+    # 检查是否已在运行
+    local pid
+    if pid=$(get_pid); then
+        log "已在运行 (PID: ${pid}), 跳过启动"
+        return 0
+    fi
+
+    # 检查可执行文件
+    if [ ! -x "${APP_BIN}" ]; then
+        log "错误: 可执行文件不存在或不可执行: ${APP_BIN}"
+        return 1
+    fi
+
+    # 检查配置文件
+    if [ ! -f "${CONFIG_FILE}" ]; then
+        log "错误: 配置文件不存在: ${CONFIG_FILE}"
+        return 1
+    fi
+
+    log "启动 OCR 翻译应用..."
+    log "  可执行: ${APP_BIN}"
+    log "  配置: ${CONFIG_FILE}"
+    log "  RT优先级: ${RT_PRIORITY}"
+
+    # 使用 chrt 设置 RT 调度策略 (SCHED_FIFO)
+    # 后台运行, 输出重定向到日志文件
+    chrt -f "${RT_PRIORITY}" "${APP_BIN}" -c "${CONFIG_FILE}" \
+        >>"${LOG_FILE}" 2>&1 &
+    local new_pid=$!
+    echo "$new_pid" > "${PID_FILE}"
+    log "已启动 (PID: ${new_pid})"
+
+    # 启动监控进程 (处理异常退出重启)
+    (
+        restart_count=0
+        while true; do
+            sleep "${RESTART_DELAY}"
+            if ! kill -0 "$new_pid" 2>/dev/null; then
+                restart_count=$((restart_count + 1))
+                if [ "${restart_count}" -gt "${MAX_RESTARTS}" ]; then
+                    log "错误: 连续重启超过 ${MAX_RESTARTS} 次, 停止重试"
+                    log "请检查系统状态并手动修复后重新启动"
+                    rm -f "${PID_FILE}"
+                    break
+                fi
+                log "警告: 进程异常退出, ${RESTART_DELAY} 秒后重启 (第 ${restart_count}/${MAX_RESTARTS} 次)"
+                sleep "${RESTART_DELAY}"
+                chrt -f "${RT_PRIORITY}" "${APP_BIN}" -c "${CONFIG_FILE}" \
+                    >>"${LOG_FILE}" 2>&1 &
+                new_pid=$!
+                echo "$new_pid" > "${PID_FILE}"
+                log "已重启 (PID: ${new_pid})"
+            fi
+        done
+    ) &
+}
+
+# ---------------------- 停止应用 ----------------------
+stop_app() {
+    local pid
+    if pid=$(get_pid); then
+        log "停止应用 (PID: ${pid})"
+        # 先发送 SIGTERM (优雅退出)
+        kill -TERM "$pid" 2>/dev/null
+        # 等待最多 5 秒
+        local count=0
+        while kill -0 "$pid" 2>/dev/null && [ $count -lt 50 ]; do
+            sleep 0.1
+            count=$((count + 1))
+        done
+        # 仍在运行则强制 kill
+        if kill -0 "$pid" 2>/dev/null; then
+            log "强制终止 (SIGKILL)"
+            kill -KILL "$pid" 2>/dev/null
+        fi
+        rm -f "${PID_FILE}"
+        log "已停止"
+    else
+        log "应用未在运行"
+    fi
+
+    # 清理可能残留的监控子进程
+    pkill -f "ocr_translator.*-c" 2>/dev/null || true
+}
+
+# ---------------------- 查询状态 ----------------------
+status_app() {
+    local pid
+    if pid=$(get_pid); then
+        log "运行中 (PID: ${pid})"
+        return 0
+    else
+        log "未运行"
+        return 3
+    fi
+}
+
+# ---------------------- 主入口 ----------------------
+case "$1" in
+    start)
+        start_app
+        ;;
+    stop)
+        stop_app
+        ;;
+    restart)
+        stop_app
+        sleep 1
+        start_app
+        ;;
+    status)
+        status_app
+        ;;
+    *)
+        echo "用法: $0 {start|stop|restart|status}"
+        exit 1
+        ;;
+esac
+
+exit 0

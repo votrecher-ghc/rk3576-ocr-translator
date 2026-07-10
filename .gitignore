@@ -1,0 +1,46 @@
+# Build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+Module.symvers
+modules.order
+.tmp_versions/
+
+# Build directories
+build/
+out/
+output/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# SDK / toolchain (external)
+bsp/u-boot/src/
+bsp/kernel/src/
+bsp/buildroot/src/
+third_party/
+*.tgz
+*.7z
+
+# WorkBuddy
+.workbuddy/
+
+# Model weights (large files)
+models/*.rknn
+models/*.onnx
+models/*.bin
+
+# Config overrides
+config/local.json
+
+# Test outputs
+tests/output/
+testdata/output/
+
+# HTML preview
+project_overview.html

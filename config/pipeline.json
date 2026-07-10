@@ -1,0 +1,86 @@
+{
+  "pipeline": {
+    "name": "ocr_translator_main",
+    "thread_model": "per_stage",
+    "rt_priority": {
+      "capture": 80,
+      "stabilize": 75,
+      "ocr_detect": 60,
+      "ocr_recognize": 55,
+      "translate": 50,
+      "render": 70,
+      "archive": 30
+    },
+    "queue_depth": {
+      "capture_to_stab": 4,
+      "stab_to_ocr": 2,
+      "ocr_to_translate": 2,
+      "translate_to_render": 2
+    },
+    "dma_buf": {
+      "enabled": true,
+      "dma_heap": "/dev/dma_heap/system-allocated",
+      "allocator": "dma_heap"
+    }
+  },
+  "stages": {
+    "capture": {
+      "module": "v4l2_capture",
+      "enabled": true,
+      "params": {
+        "use_dmabuf": true,
+        "zero_copy": true
+      }
+    },
+    "stabilize": {
+      "module": "imu_stab",
+      "enabled": true,
+      "params": {
+        "use_madgwick": true,
+        "crop_strategy": "center"
+      }
+    },
+    "ocr_detect": {
+      "module": "rknn_det",
+      "enabled": true,
+      "params": {
+        "use_rga_resize": true,
+        "input_width": 960,
+        "input_height": 960
+      }
+    },
+    "ocr_recognize": {
+      "module": "rknn_rec",
+      "enabled": true,
+      "params": {
+        "use_rga_resize": true,
+        "input_width": 320,
+        "input_height": 48
+      }
+    },
+    "translate": {
+      "module": "rknn_translate",
+      "enabled": true,
+      "params": {
+        "beam_size": 1,
+        "use_fp16": true
+      }
+    },
+    "render": {
+      "module": "drm_render",
+      "enabled": true,
+      "params": {
+        "use_overlay_plane": true,
+        "blend_mode": "premult"
+      }
+    },
+    "archive": {
+      "module": "jpeg_archive",
+      "enabled": true,
+      "params": {
+        "save_on_change": true,
+        "dedup_interval_ms": 500
+      }
+    }
+  }
+}
