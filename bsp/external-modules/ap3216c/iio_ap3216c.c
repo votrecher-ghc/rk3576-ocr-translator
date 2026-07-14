@@ -2,17 +2,13 @@
 /*
  * AP3216C ambient-light, proximity and infrared sensor driver
  *
- * The AP3216C is connected through I2C and exposes three direct-mode
- * Industrial I/O channels:
+ * All register accesses are implemented directly with i2c_transfer().
+ * The device exposes three direct-mode Industrial I/O channels:
  *
  *   in_illuminance_raw
  *   in_illuminance_scale
  *   in_proximity_raw
  *   in_intensity_ir_raw
- *
- * Interrupt/event support is intentionally not included in this first
- * version. The INT pin may remain unconnected and userspace can read the
- * direct-mode IIO attributes.
  */
 
 #include <linux/bitops.h>
@@ -24,13 +20,11 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/pm.h>
-#include <linux/regmap.h>
 
 #define AP3216C_DRV_NAME                     "ap3216c"
 
 /* System registers. */
 #define AP3216C_REG_SYSTEM_CONFIG             0x00
-#define AP3216C_REG_INT_STATUS                0x01
 #define AP3216C_REG_INT_CLEAR_MANNER          0x02
 #define AP3216C_REG_IR_DATA_LOW               0x0a
 #define AP3216C_REG_IR_DATA_HIGH              0x0b
@@ -41,20 +35,13 @@
 
 /* ALS registers. */
 #define AP3216C_REG_ALS_CONFIG                 0x10
-#define AP3216C_REG_ALS_CALIBRATION            0x19
 
 /* PS/IR registers. */
 #define AP3216C_REG_PS_CONFIG                  0x20
 #define AP3216C_REG_PS_LED_CONTROL             0x21
-#define AP3216C_REG_PS_INT_MODE                0x22
-#define AP3216C_REG_PS_MEAN_TIME               0x23
-#define AP3216C_REG_PS_LED_WAITING             0x24
-#define AP3216C_REG_MAX                        0x2d
 
 /* SYSTEM_CONFIG[2:0]. */
 #define AP3216C_MODE_POWER_DOWN                0x00
-#define AP3216C_MODE_ALS_ACTIVE                0x01
-#define AP3216C_MODE_PS_IR_ACTIVE              0x02
 #define AP3216C_MODE_ALS_PS_IR_ACTIVE          0x03
 #define AP3216C_MODE_SW_RESET                  0x04
 
@@ -62,7 +49,6 @@
 #define AP3216C_IR_OVERFLOW                    BIT(7)
 #define AP3216C_IR_DATA_LOW_MASK               GENMASK(1, 0)
 
-#define AP3216C_PS_OBJECT_NEAR                 BIT(7)
 #define AP3216C_PS_IR_OVERFLOW                 BIT(6)
 #define AP3216C_PS_DATA_LOW_MASK               GENMASK(3, 0)
 #define AP3216C_PS_DATA_HIGH_MASK              GENMASK(5, 0)
@@ -70,21 +56,17 @@
 #define AP3216C_ALS_RANGE_SHIFT                4
 #define AP3216C_ALS_RANGE_MASK                 GENMASK(5, 4)
 
-/* Datasheet reset time is 10 ms. */
 #define AP3216C_RESET_DELAY_US_MIN             10000
 #define AP3216C_RESET_DELAY_US_MAX             12000
-
-/* Combined ALS + PS/IR conversion time is typically 112.5 ms. */
 #define AP3216C_FIRST_SAMPLE_DELAY_MS          120
 
-/* Explicit datasheet defaults used by this driver. */
 #define AP3216C_ALS_CONFIG_DEFAULT             0x00
 #define AP3216C_PS_CONFIG_DEFAULT              0x05
 #define AP3216C_PS_LED_CONTROL_DEFAULT         0x13
 #define AP3216C_INT_CLEAR_AUTOMATIC            0x00
 
 struct ap3216c_data {
-	struct regmap *regmap;
+	struct i2c_client *client;
 	struct mutex lock;
 };
 
@@ -96,80 +78,121 @@ static const int ap3216c_als_scale_micro[] = {
 	4900,
 };
 
-static const struct regmap_config ap3216c_regmap_config = {
-	.reg_bits = 8,
-	.val_bits = 8,
-	.max_register = AP3216C_REG_MAX,
-	.cache_type = REGCACHE_NONE,
-};
+/*
+ * The caller serializes register access with data->lock. A register read uses
+ * a write message for the register address followed by a repeated-start read.
+ */
+static int ap3216c_read_reg_locked(struct ap3216c_data *data, u8 reg, u8 *value)
+{
+	struct i2c_client *client = data->client;
+	u16 flags = client->flags & I2C_M_TEN;
+	u8 reg_buf = reg;
+	struct i2c_msg msgs[] = {
+		{
+			.addr = client->addr,
+			.flags = flags,
+			.len = sizeof(reg_buf),
+			.buf = &reg_buf,
+		},
+		{
+			.addr = client->addr,
+			.flags = flags | I2C_M_RD,
+			.len = sizeof(*value),
+			.buf = value,
+		},
+	};
+	int ret;
+
+	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
+	if (ret < 0)
+		return ret;
+	if (ret != ARRAY_SIZE(msgs))
+		return -EIO;
+
+	return 0;
+}
+
+static int ap3216c_write_reg_locked(struct ap3216c_data *data, u8 reg, u8 value)
+{
+	struct i2c_client *client = data->client;
+	u16 flags = client->flags & I2C_M_TEN;
+	u8 tx_buf[] = { reg, value };
+	struct i2c_msg msg = {
+		.addr = client->addr,
+		.flags = flags,
+		.len = sizeof(tx_buf),
+		.buf = tx_buf,
+	};
+	int ret;
+
+	ret = i2c_transfer(client->adapter, &msg, 1);
+	if (ret < 0)
+		return ret;
+	if (ret != 1)
+		return -EIO;
+
+	return 0;
+}
 
 /*
- * AP3216C latches the high byte when the corresponding low byte is read.
- * Keep the reads ordered and protected by the device mutex.
+ * AP3216C latches the high byte when the corresponding low byte is read. Keep
+ * these two transfers ordered and protected by the device mutex.
  */
 static int ap3216c_read_pair_locked(struct ap3216c_data *data,
-				    unsigned int low_reg,
-				    unsigned int high_reg,
-				    unsigned int *low,
-				    unsigned int *high)
+				    u8 low_reg, u8 high_reg,
+				    u8 *low, u8 *high)
 {
 	int ret;
 
-	ret = regmap_read(data->regmap, low_reg, low);
+	ret = ap3216c_read_reg_locked(data, low_reg, low);
 	if (ret)
 		return ret;
 
-	return regmap_read(data->regmap, high_reg, high);
+	return ap3216c_read_reg_locked(data, high_reg, high);
 }
 
 static int ap3216c_read_als_locked(struct ap3216c_data *data, int *value)
 {
-	unsigned int low;
-	unsigned int high;
+	u8 low;
+	u8 high;
 	int ret;
 
-	ret = ap3216c_read_pair_locked(data,
-					AP3216C_REG_ALS_DATA_LOW,
-					AP3216C_REG_ALS_DATA_HIGH,
-					&low, &high);
+	ret = ap3216c_read_pair_locked(data, AP3216C_REG_ALS_DATA_LOW,
+				       AP3216C_REG_ALS_DATA_HIGH, &low, &high);
 	if (ret)
 		return ret;
 
-	*value = ((high & 0xff) << 8) | (low & 0xff);
+	*value = ((unsigned int)high << 8) | low;
 	return 0;
 }
 
 static int ap3216c_read_ir_locked(struct ap3216c_data *data, int *value)
 {
-	unsigned int low;
-	unsigned int high;
+	u8 low;
+	u8 high;
 	int ret;
 
-	ret = ap3216c_read_pair_locked(data,
-					AP3216C_REG_IR_DATA_LOW,
-					AP3216C_REG_IR_DATA_HIGH,
-					&low, &high);
+	ret = ap3216c_read_pair_locked(data, AP3216C_REG_IR_DATA_LOW,
+				       AP3216C_REG_IR_DATA_HIGH, &low, &high);
 	if (ret)
 		return ret;
 
 	if (low & AP3216C_IR_OVERFLOW)
 		return -EOVERFLOW;
 
-	*value = ((high & 0xff) << 2) |
+	*value = ((unsigned int)high << 2) |
 		 (low & AP3216C_IR_DATA_LOW_MASK);
 	return 0;
 }
 
 static int ap3216c_read_ps_locked(struct ap3216c_data *data, int *value)
 {
-	unsigned int low;
-	unsigned int high;
+	u8 low;
+	u8 high;
 	int ret;
 
-	ret = ap3216c_read_pair_locked(data,
-					AP3216C_REG_PS_DATA_LOW,
-					AP3216C_REG_PS_DATA_HIGH,
-					&low, &high);
+	ret = ap3216c_read_pair_locked(data, AP3216C_REG_PS_DATA_LOW,
+				       AP3216C_REG_PS_DATA_HIGH, &low, &high);
 	if (ret)
 		return ret;
 
@@ -184,16 +207,15 @@ static int ap3216c_read_ps_locked(struct ap3216c_data *data, int *value)
 static int ap3216c_read_als_scale_locked(struct ap3216c_data *data,
 					 int *val, int *val2)
 {
-	unsigned int config;
+	u8 config;
 	unsigned int range;
 	int ret;
 
-	ret = regmap_read(data->regmap, AP3216C_REG_ALS_CONFIG, &config);
+	ret = ap3216c_read_reg_locked(data, AP3216C_REG_ALS_CONFIG, &config);
 	if (ret)
 		return ret;
 
-	range = (config & AP3216C_ALS_RANGE_MASK) >>
-		AP3216C_ALS_RANGE_SHIFT;
+	range = (config & AP3216C_ALS_RANGE_MASK) >> AP3216C_ALS_RANGE_SHIFT;
 
 	*val = 0;
 	*val2 = ap3216c_als_scale_micro[range];
@@ -231,12 +253,10 @@ static int ap3216c_read_raw(struct iio_dev *indio_dev,
 		break;
 
 	case IIO_CHAN_INFO_SCALE:
-		if (chan->type != IIO_LIGHT) {
+		if (chan->type != IIO_LIGHT)
 			ret = -EINVAL;
-			break;
-		}
-
-		ret = ap3216c_read_als_scale_locked(data, val, val2);
+		else
+			ret = ap3216c_read_als_scale_locked(data, val, val2);
 		break;
 
 	default:
@@ -270,16 +290,14 @@ static const struct iio_chan_spec ap3216c_channels[] = {
 	},
 };
 
-static int ap3216c_set_mode_locked(struct ap3216c_data *data,
-				   unsigned int mode)
+static int ap3216c_set_mode_locked(struct ap3216c_data *data, u8 mode)
 {
-	return regmap_write(data->regmap, AP3216C_REG_SYSTEM_CONFIG,
-			    mode);
+	return ap3216c_write_reg_locked(data, AP3216C_REG_SYSTEM_CONFIG, mode);
 }
 
 static int ap3216c_chip_init(struct ap3216c_data *data)
 {
-	unsigned int config;
+	u8 config;
 	int ret;
 
 	mutex_lock(&data->lock);
@@ -291,33 +309,31 @@ static int ap3216c_chip_init(struct ap3216c_data *data)
 	usleep_range(AP3216C_RESET_DELAY_US_MIN,
 		     AP3216C_RESET_DELAY_US_MAX);
 
-	ret = regmap_write(data->regmap, AP3216C_REG_INT_CLEAR_MANNER,
-			   AP3216C_INT_CLEAR_AUTOMATIC);
+	ret = ap3216c_write_reg_locked(data, AP3216C_REG_INT_CLEAR_MANNER,
+				       AP3216C_INT_CLEAR_AUTOMATIC);
 	if (ret)
 		goto out_unlock;
 
-	ret = regmap_write(data->regmap, AP3216C_REG_ALS_CONFIG,
-			   AP3216C_ALS_CONFIG_DEFAULT);
+	ret = ap3216c_write_reg_locked(data, AP3216C_REG_ALS_CONFIG,
+				       AP3216C_ALS_CONFIG_DEFAULT);
 	if (ret)
 		goto out_unlock;
 
-	ret = regmap_write(data->regmap, AP3216C_REG_PS_CONFIG,
-			   AP3216C_PS_CONFIG_DEFAULT);
+	ret = ap3216c_write_reg_locked(data, AP3216C_REG_PS_CONFIG,
+				       AP3216C_PS_CONFIG_DEFAULT);
 	if (ret)
 		goto out_unlock;
 
-	ret = regmap_write(data->regmap, AP3216C_REG_PS_LED_CONTROL,
-			   AP3216C_PS_LED_CONTROL_DEFAULT);
+	ret = ap3216c_write_reg_locked(data, AP3216C_REG_PS_LED_CONTROL,
+				       AP3216C_PS_LED_CONTROL_DEFAULT);
 	if (ret)
 		goto out_unlock;
 
-	ret = ap3216c_set_mode_locked(data,
-				      AP3216C_MODE_ALS_PS_IR_ACTIVE);
+	ret = ap3216c_set_mode_locked(data, AP3216C_MODE_ALS_PS_IR_ACTIVE);
 	if (ret)
 		goto out_unlock;
 
-	/* A readback catches a missing or non-responsive device. */
-	ret = regmap_read(data->regmap, AP3216C_REG_SYSTEM_CONFIG, &config);
+	ret = ap3216c_read_reg_locked(data, AP3216C_REG_SYSTEM_CONFIG, &config);
 	if (ret)
 		goto out_unlock;
 
@@ -341,17 +357,17 @@ static int ap3216c_probe(struct i2c_client *client,
 	struct iio_dev *indio_dev;
 	int ret;
 
+	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
+		return dev_err_probe(dev, -EOPNOTSUPP,
+				     "adapter does not support plain I2C transfers\n");
+
 	indio_dev = devm_iio_device_alloc(dev, sizeof(*data));
 	if (!indio_dev)
 		return -ENOMEM;
 
 	data = iio_priv(indio_dev);
+	data->client = client;
 	mutex_init(&data->lock);
-
-	data->regmap = devm_regmap_init_i2c(client, &ap3216c_regmap_config);
-	if (IS_ERR(data->regmap))
-		return dev_err_probe(dev, PTR_ERR(data->regmap),
-				     "failed to initialise regmap\n");
 
 	i2c_set_clientdata(client, indio_dev);
 
@@ -410,8 +426,7 @@ static int __maybe_unused ap3216c_resume(struct device *dev)
 	int ret;
 
 	mutex_lock(&data->lock);
-	ret = ap3216c_set_mode_locked(data,
-				      AP3216C_MODE_ALS_PS_IR_ACTIVE);
+	ret = ap3216c_set_mode_locked(data, AP3216C_MODE_ALS_PS_IR_ACTIVE);
 	mutex_unlock(&data->lock);
 
 	if (!ret)
