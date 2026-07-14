@@ -2,14 +2,9 @@
 /*
  * ADT7410 high-accuracy digital temperature sensor driver
  *
- * The device is connected through I2C and exposed as one direct-mode
- * Industrial I/O temperature channel:
- *
- *   in_temp_raw
- *   in_temp_scale
- *
- * The driver configures 16-bit continuous-conversion mode. Interrupt and
- * threshold-event support are intentionally not included in this version.
+ * All register accesses are implemented directly with i2c_transfer().
+ * The device is exposed as one direct-mode Industrial I/O temperature
+ * channel and configured for 16-bit continuous conversion.
  */
 
 #include <linux/bitops.h>
@@ -21,7 +16,6 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/pm.h>
-#include <linux/regmap.h>
 
 #define ADT7410_DRV_NAME                      "adt7410"
 
@@ -29,21 +23,12 @@
 #define ADT7410_REG_TEMPERATURE               0x00
 #define ADT7410_REG_STATUS                    0x02
 #define ADT7410_REG_CONFIG                    0x03
-#define ADT7410_REG_T_HIGH                    0x04
-#define ADT7410_REG_T_LOW                     0x06
-#define ADT7410_REG_T_CRIT                    0x08
-#define ADT7410_REG_T_HYST                    0x0a
 #define ADT7410_REG_ID                        0x0b
-#define ADT7410_REG_MAX                       ADT7410_REG_ID
 
 /* STATUS register. */
-#define ADT7410_STATUS_T_LOW                  BIT(4)
-#define ADT7410_STATUS_T_HIGH                 BIT(5)
-#define ADT7410_STATUS_T_CRIT                 BIT(6)
 #define ADT7410_STATUS_NOT_READY              BIT(7)
 
 /* CONFIG register. */
-#define ADT7410_CONFIG_FAULT_QUEUE_MASK       GENMASK(1, 0)
 #define ADT7410_CONFIG_CT_POLARITY            BIT(2)
 #define ADT7410_CONFIG_INT_POLARITY           BIT(3)
 #define ADT7410_CONFIG_EVENT_MODE             BIT(4)
@@ -68,27 +53,109 @@
 
 struct adt7410_data {
 	struct i2c_client *client;
-	struct regmap *regmap;
 	struct mutex lock;
 	u8 original_config;
 	u8 active_config;
 };
 
-static const struct regmap_config adt7410_regmap_config = {
-	.reg_bits = 8,
-	.val_bits = 8,
-	.max_register = ADT7410_REG_MAX,
-	.cache_type = REGCACHE_NONE,
-};
+/*
+ * The caller serializes access with data->lock. Reads use a write message for
+ * the register address followed by a repeated-start read message.
+ */
+static int adt7410_read_reg_locked(struct adt7410_data *data, u8 reg, u8 *value)
+{
+	struct i2c_client *client = data->client;
+	u16 flags = client->flags & I2C_M_TEN;
+	u8 reg_buf = reg;
+	struct i2c_msg msgs[] = {
+		{
+			.addr = client->addr,
+			.flags = flags,
+			.len = sizeof(reg_buf),
+			.buf = &reg_buf,
+		},
+		{
+			.addr = client->addr,
+			.flags = flags | I2C_M_RD,
+			.len = sizeof(*value),
+			.buf = value,
+		},
+	};
+	int ret;
+
+	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
+	if (ret < 0)
+		return ret;
+	if (ret != ARRAY_SIZE(msgs))
+		return -EIO;
+
+	return 0;
+}
+
+static int adt7410_write_reg_locked(struct adt7410_data *data,
+				    u8 reg, u8 value)
+{
+	struct i2c_client *client = data->client;
+	u16 flags = client->flags & I2C_M_TEN;
+	u8 tx_buf[] = { reg, value };
+	struct i2c_msg msg = {
+		.addr = client->addr,
+		.flags = flags,
+		.len = sizeof(tx_buf),
+		.buf = tx_buf,
+	};
+	int ret;
+
+	ret = i2c_transfer(client->adapter, &msg, 1);
+	if (ret < 0)
+		return ret;
+	if (ret != 1)
+		return -EIO;
+
+	return 0;
+}
+
+static int adt7410_read_be16_locked(struct adt7410_data *data,
+				    u8 reg, u16 *value)
+{
+	struct i2c_client *client = data->client;
+	u16 flags = client->flags & I2C_M_TEN;
+	u8 reg_buf = reg;
+	u8 rx_buf[2];
+	struct i2c_msg msgs[] = {
+		{
+			.addr = client->addr,
+			.flags = flags,
+			.len = sizeof(reg_buf),
+			.buf = &reg_buf,
+		},
+		{
+			.addr = client->addr,
+			.flags = flags | I2C_M_RD,
+			.len = sizeof(rx_buf),
+			.buf = rx_buf,
+		},
+	};
+	int ret;
+
+	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
+	if (ret < 0)
+		return ret;
+	if (ret != ARRAY_SIZE(msgs))
+		return -EIO;
+
+	*value = ((u16)rx_buf[0] << 8) | rx_buf[1];
+	return 0;
+}
 
 static int adt7410_wait_ready_locked(struct adt7410_data *data)
 {
-	unsigned int status;
+	u8 status;
 	int ret;
 	int i;
 
 	for (i = 0; i < ADT7410_READY_RETRIES; i++) {
-		ret = regmap_read(data->regmap, ADT7410_REG_STATUS, &status);
+		ret = adt7410_read_reg_locked(data, ADT7410_REG_STATUS, &status);
 		if (ret)
 			return ret;
 
@@ -104,23 +171,18 @@ static int adt7410_wait_ready_locked(struct adt7410_data *data)
 static int adt7410_read_temperature_locked(struct adt7410_data *data,
 					   int *value)
 {
+	u16 raw;
 	int ret;
 
 	ret = adt7410_wait_ready_locked(data);
 	if (ret)
 		return ret;
 
-	/*
-	 * ADT7410 places the MSB at register 0x00 and the LSB at 0x01.
-	 * SMBus word transactions are little-endian, therefore the swapped
-	 * helper returns the device's big-endian register value correctly.
-	 */
-	ret = i2c_smbus_read_word_swapped(data->client,
-					   ADT7410_REG_TEMPERATURE);
-	if (ret < 0)
+	ret = adt7410_read_be16_locked(data, ADT7410_REG_TEMPERATURE, &raw);
+	if (ret)
 		return ret;
 
-	*value = (s16)ret;
+	*value = (s16)raw;
 	return 0;
 }
 
@@ -168,7 +230,7 @@ static const struct iio_chan_spec adt7410_channels[] = {
 
 static int adt7410_write_config_locked(struct adt7410_data *data, u8 config)
 {
-	return regmap_write(data->regmap, ADT7410_REG_CONFIG, config);
+	return adt7410_write_reg_locked(data, ADT7410_REG_CONFIG, config);
 }
 
 static void adt7410_restore_config(void *private)
@@ -182,12 +244,12 @@ static void adt7410_restore_config(void *private)
 
 static int adt7410_chip_init(struct adt7410_data *data)
 {
-	unsigned int value;
+	u8 value;
 	int ret;
 
 	mutex_lock(&data->lock);
 
-	ret = regmap_read(data->regmap, ADT7410_REG_ID, &value);
+	ret = adt7410_read_reg_locked(data, ADT7410_REG_ID, &value);
 	if (ret)
 		goto out_unlock;
 
@@ -196,7 +258,7 @@ static int adt7410_chip_init(struct adt7410_data *data)
 		goto out_unlock;
 	}
 
-	ret = regmap_read(data->regmap, ADT7410_REG_CONFIG, &value);
+	ret = adt7410_read_reg_locked(data, ADT7410_REG_CONFIG, &value);
 	if (ret)
 		goto out_unlock;
 
@@ -228,11 +290,9 @@ static int adt7410_probe(struct i2c_client *client,
 	struct iio_dev *indio_dev;
 	int ret;
 
-	if (!i2c_check_functionality(client->adapter,
-				     I2C_FUNC_SMBUS_BYTE_DATA |
-				     I2C_FUNC_SMBUS_WORD_DATA))
+	if (!i2c_check_functionality(client->adapter, I2C_FUNC_I2C))
 		return dev_err_probe(dev, -EOPNOTSUPP,
-				     "required SMBus operations are unavailable\n");
+				     "adapter does not support plain I2C transfers\n");
 
 	indio_dev = devm_iio_device_alloc(dev, sizeof(*data));
 	if (!indio_dev)
@@ -241,11 +301,6 @@ static int adt7410_probe(struct i2c_client *client,
 	data = iio_priv(indio_dev);
 	data->client = client;
 	mutex_init(&data->lock);
-
-	data->regmap = devm_regmap_init_i2c(client, &adt7410_regmap_config);
-	if (IS_ERR(data->regmap))
-		return dev_err_probe(dev, PTR_ERR(data->regmap),
-				     "failed to initialise regmap\n");
 
 	i2c_set_clientdata(client, indio_dev);
 
