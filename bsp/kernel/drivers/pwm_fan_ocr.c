@@ -299,7 +299,7 @@ reschedule:
  * 返回: 读取的值，负数错误码
  */
 static int pwm_fan_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
-			      u32 attr, int channel)
+			      u32 attr, int channel, long *val)
 {
 	struct pwm_fan_ocr *fan = dev_get_drvdata(dev);
 
@@ -307,21 +307,24 @@ static int pwm_fan_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 	case hwmon_fan:
 		if (attr == hwmon_fan_input) {
 			/* 返回当前PWM占空比作为风扇转速参考 */
-			return fan->current_duty;
+			*val = fan->current_duty;
+			return 0;
 		}
 		break;
 
 	case hwmon_temp:
 		if (attr == hwmon_temp_input) {
 			/* 返回当前温度（毫摄氏度） */
-			return fan->current_temp;
+			*val = fan->current_temp;
+			return 0;
 		}
 		break;
 
 	case hwmon_pwm:
 		if (attr == hwmon_pwm_input) {
 			/* 返回当前PWM占空比 */
-			return fan->current_duty;
+			*val = fan->current_duty;
+			return 0;
 		}
 		break;
 

@@ -7,6 +7,7 @@
 
 #include "drm_device.h"
 #include "drm_plane.h"
+#include <stddef.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
 
@@ -21,11 +22,16 @@ typedef struct {
     int               font_size;   /* 字号 */
     uint32_t          width;       /* 叠加层宽 */
     uint32_t          height;      /* 叠加层高 */
-    void             *pixels;      /* ARGB 像素缓冲（CPU 可写） */
-    size_t            pixel_size;  /* 像素缓冲大小 */
-    int               dmabuf_fd;   /* 叠加层 DMA-BUF fd */
-    uint32_t          fb_id;       /* DRM FB ID */
-    uint32_t          gem_handle;  /* GEM handle */
+    uint32_t          pitch[2];       /* 双缓冲行跨度 */
+    void             *pixels[2];      /* mmap 的 DRM dumb buffer */
+    size_t            pixel_size[2];  /* dumb buffer 映射大小 */
+    int               dmabuf_fd[2];   /* 可选 PRIME fd */
+    uint32_t          fb_id[2];       /* DRM FB ID */
+    uint32_t          gem_handle[2];  /* dumb GEM handle */
+    int               draw_index;     /* 当前 CPU 绘制的非 scanout buffer */
+    int               active_index;   /* 当前 scanout buffer，-1=尚未提交 */
+    int               initialized; /* 完整初始化标志 */
+    int               resource_active; /* init 已建立资源生命周期 */
 } ocr_drm_overlay_t;
 
 /**
@@ -59,9 +65,7 @@ int ocr_overlay_render_text(ocr_drm_overlay_t *overlay, const char *text,
  */
 int ocr_overlay_clear(ocr_drm_overlay_t *overlay);
 
-/**
- * @brief 提交叠加层到 DRM（更新 Plane1）
- */
+/** @brief 提交非活动缓冲到 Plane1，等待 vblank 后交换双缓冲。 */
 int ocr_overlay_commit(ocr_drm_overlay_t *overlay);
 
 /**

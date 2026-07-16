@@ -14,39 +14,43 @@
   },
   "display": {
     "device": "/dev/dri/card0",
-    "plane_primary": 0,
-    "plane_overlay": 1,
-    "overlay_format": "XR24",
     "display_width": 1920,
     "display_height": 1080
   },
   "ai": {
     "det_model": "/usr/share/ocr/models/ppocrv4_det_int8.rknn",
     "rec_model": "/usr/share/ocr/models/ppocrv4_rec_fp16.rknn",
-    "trans_model": "/usr/share/ocr/models/lite_transformer_fp16.rknn",
+    "rec_vocab": "/usr/share/ocr/models/ppocr_keys_v1.txt",
+    "trans_encoder_model": "/usr/share/ocr/models/lite_transformer_encoder_fp16.rknn",
+    "trans_decoder_model": "/usr/share/ocr/models/lite_transformer_decoder_fp16.rknn",
+    "trans_manifest": "/usr/share/ocr/models/translation_manifest.json",
+    "src_vocab": "/usr/share/ocr/models/translation_src_vocab.txt",
+    "tgt_vocab": "/usr/share/ocr/models/translation_tgt_vocab.txt",
     "det_threshold": 0.3,
-    "rec_batch_size": 6,
-    "max_seq_len": 128,
+    "det_box_threshold": 0.6,
+    "allow_ocr_only": false,
     "src_lang": "en",
     "dst_lang": "zh"
   },
   "stab": {
-    "imu_device": "/dev/iio:device2",
-    "sample_rate": 500,
+    "imu_device": "auto",
+    "sample_rate": 1000,
     "crop_ratio": 0.9,
     "filter_beta": 0.1,
     "madgwick_beta": 0.1
   },
   "sensors": {
-    "light_poll_interval_ms": 1000,
-    "temp_poll_interval_ms": 1000,
+    "ambient_light_device": "auto",
+    "temperature_device": "auto",
     "backlight_path": "/sys/class/backlight/panel-backlight/brightness",
-    "pwm_fan_path": "/sys/class/pwm/pwmchip11/pwm0/duty_cycle"
+    "pwm_fan_path": "auto"
+  },
+  "input": {
+    "key_device": "auto"
   },
   "archive": {
     "base_dir": "/data/ocr",
     "max_usage_pct": 90,
-    "max_entries": 1000,
     "jpeg_quality": 90
   }
 }

@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdatomic.h>
 
 /** 事件回调函数原型
  * @param fd     就绪的文件描述符
@@ -29,8 +30,10 @@ typedef struct {
 /** 事件循环上下文 */
 typedef struct {
     int          epoll_fd;   /* epoll 实例 fd */
-    int          running;    /* 运行标志 */
+    int          wake_fd;    /* 跨线程停止事件循环的 eventfd */
+    atomic_int   running;    /* 运行标志 */
     int          max_events; /* 最大事件数 */
+    void        *impl;       /* 私有事件注册表 */
 } ocr_event_loop_t;
 
 /**
@@ -57,6 +60,11 @@ int ocr_event_loop_add(ocr_event_loop_t *loop, const ocr_event_t *ev);
  * @brief 删除 fd 监听
  */
 int ocr_event_loop_del(ocr_event_loop_t *loop, int fd);
+
+/**
+ * @brief 修改已注册 fd 的事件掩码、回调或用户数据
+ */
+int ocr_event_loop_mod(ocr_event_loop_t *loop, const ocr_event_t *ev);
 
 /**
  * @brief 运行事件循环（阻塞直到 ocr_event_loop_stop 被调用）

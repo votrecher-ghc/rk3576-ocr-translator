@@ -23,7 +23,7 @@ OUTPUT_DIR = os.environ.get("MODEL_OUTPUT_DIR",
 # 模型源文件 (ONNX)
 ONNX_URL = os.environ.get(
     "REC_ONNX_URL",
-    "https://paddleocr.bj.bcebos.com/PP-OCRv4/chinese/ch_PP-OCRv4_rec_infer.onnx"
+    ""
 )
 ONNX_PATH = os.environ.get("REC_ONNX_PATH",
                            os.path.join(SCRIPT_DIR, "ch_PP-OCRv4_rec_infer.onnx"))
@@ -37,8 +37,9 @@ RKNN_TARGET = "rk3576"    # 目标平台
 # 模型输入配置 (rec 模型: 宽度动态, 高度固定 48)
 INPUT_WIDTH = 320
 INPUT_HEIGHT = 48
-MEAN_VALUES = [[0.5, 0.5, 0.5]]
-STD_VALUES = [[0.5, 0.5, 0.5]]
+# Equivalent to (pixel / 255 - 0.5) / 0.5 for raw 0..255 RGB input.
+MEAN_VALUES = [[127.5, 127.5, 127.5]]
+STD_VALUES = [[127.5, 127.5, 127.5]]
 
 
 def log(msg: str) -> None:
@@ -58,9 +59,12 @@ def download_onnx() -> None:
     if os.path.exists(ONNX_PATH):
         log(f"ONNX 模型已存在, 跳过下载: {ONNX_PATH}")
         return
+    if not ONNX_URL:
+        err("未找到识别 ONNX；请先按 PaddleOCR 官方 Paddle2ONNX 流程导出，"
+            "再设置 REC_ONNX_PATH（或显式设置 REC_ONNX_URL）")
 
     log(f"下载 ONNX 模型: {ONNX_URL}")
-    os.makedirs(os.path.dirname(ONNX_PATH), exist_ok=True)
+    os.makedirs(os.path.dirname(ONNX_PATH) or ".", exist_ok=True)
     try:
         urllib.request.urlretrieve(ONNX_URL, ONNX_PATH)
         log("下载完成")
@@ -85,7 +89,6 @@ def convert_to_rknn() -> None:
         mean_values=MEAN_VALUES,
         std_values=STD_VALUES,
         target_platform=RKNN_TARGET,
-        quantized_dtype="w16a16",   # FP16 量化
         optimization_level=3,
     )
 
@@ -124,10 +127,16 @@ def verify_output() -> None:
 
 # ---------------------- 主流程 ----------------------
 def main() -> None:
+    global RKNN_TARGET
     parser = argparse.ArgumentParser(description="PaddleOCR rec 模型转 RKNN (FP16)")
     parser.add_argument("--skip-download", action="store_true",
                         help="跳过 ONNX 下载步骤 (已手动准备)")
+    parser.add_argument("--target", default=os.environ.get(
+        "RKNN_TARGET", RKNN_TARGET), help="RKNN 目标平台")
+    parser.add_argument("--quantize", choices=("fp16",), default="fp16",
+                        help="兼容统一转换命令；识别模型仅支持 fp16")
     args = parser.parse_args()
+    RKNN_TARGET = args.target
 
     log("=== 识别模型转换开始 ===")
     if not args.skip_download:

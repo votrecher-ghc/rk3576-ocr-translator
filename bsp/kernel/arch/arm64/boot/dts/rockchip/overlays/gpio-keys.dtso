@@ -4,7 +4,7 @@
  *
  * 描述: 鲁班猫3 40Pin上的GPIO按键，用于触发OCR拍照。
  *       GPIO0 PC0 (Pin对应鲁班猫3 40Pin表)
- *       按键码: KEY_CAMERA (0xd8)
+ *       按键码: KEY_CAMERA (0xd4)
  *       消抖间隔: 20ms
  *
  * 作者: OCR Team <ocr@example.com>
@@ -22,7 +22,7 @@
 	compatible = "rockchip,rk3576";
 
 	fragment@0 {
-		target = <&gpio0>;
+		target-path = "/";
 
 		__overlay__ {
 			/*
@@ -37,7 +37,7 @@
 				/* GPIO0 PC0, 低电平有效 */
 				gpios = <&gpio0 16 GPIO_ACTIVE_LOW>;
 
-				/* 按键码: KEY_CAMERA = 0xd8 */
+				/* 按键码: KEY_CAMERA = 0xd4 */
 				linux,code = <KEY_CAMERA>;
 
 				/* 消抖间隔: 20ms */

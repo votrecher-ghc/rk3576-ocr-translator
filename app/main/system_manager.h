@@ -25,6 +25,7 @@ typedef struct {
     atomic_int      feed_count;   /* 看门狗喂狗计数 */
     ocr_thread_t    watchdog_tid; /* 看门狗线程 */
     atomic_int      watchdog_running; /* 看门狗运行标志 */
+    uint32_t        watchdog_timeout_ms; /* 看门狗超时 */
     uint64_t        start_time;   /* 启动时间 */
 } ocr_system_manager_t;
 

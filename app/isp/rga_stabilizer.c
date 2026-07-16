@@ -24,7 +24,11 @@ int ocr_rga_stab_init(ocr_rga_stabilizer_t *stab, float alpha)
 int ocr_rga_stab_update(ocr_rga_stabilizer_t *stab, const ocr_stab_params_t *params)
 {
     if (!stab || !params) return -1;
+    if (!isfinite(params->dx) || !isfinite(params->dy) ||
+        !isfinite(params->angle) || !isfinite(params->scale) ||
+        params->scale < 1.0f) return -2;
     stab->target = *params;
+    stab->target.scale = ocr_clamp_f(stab->target.scale, 1.0f, 2.0f);
     return 0;
 }
 
@@ -42,22 +46,35 @@ int ocr_rga_stab_apply(ocr_rga_stabilizer_t *stab, ocr_buffer_t *src, ocr_buffer
     stab->cur.angle = ocr_lowpass(stab->cur.angle, stab->target.angle, stab->alpha);
     stab->cur.scale = ocr_lowpass(stab->cur.scale, stab->target.scale, stab->alpha);
 
-    /* 旋转（90 度整数倍用 RGA，任意角度 TODO: 需仿射变换） */
-    int ret = 0;
+    int ret;
     if (fabsf(stab->cur.angle) > 0.1f) {
-        /* TODO: RGA 不支持任意角度旋转，需用 imresize + 平移近似，
-         * 或改用 CPU 仿射变换。此处仅做平移补偿。 */
-        LOG_D("防抖旋转角 %.2f 度（暂忽略）", stab->cur.angle);
+        /* RK3576 RGA exposes only right-angle rotation through im2d. Small
+         * arbitrary roll is compensated by the crop/translation envelope. */
+        LOG_D("RGA arbitrary rotation %.2f deg approximated by crop/shift",
+              stab->cur.angle);
     }
 
-    /* 平移补偿（反向） */
-    if (fabsf(stab->cur.dx) >= 1.0f || fabsf(stab->cur.dy) >= 1.0f) {
-        ret = ocr_rga_translate(src, dst,
-                                (int32_t)(-stab->cur.dx),
-                                (int32_t)(-stab->cur.dy));
-    } else {
-        ret = ocr_rga_resize(src, dst);
+    float scale = ocr_clamp_f(stab->cur.scale, 1.0f, 2.0f);
+    uint32_t crop_w = (uint32_t)((float)src->width / scale);
+    uint32_t crop_h = (uint32_t)((float)src->height / scale);
+    crop_w &= ~1U;
+    crop_h &= ~1U;
+    if (crop_w < 2 || crop_h < 2) return -2;
+
+    int max_x = (int)src->width - (int)crop_w;
+    int max_y = (int)src->height - (int)crop_h;
+    int crop_x = max_x / 2 - (int)lrintf(stab->cur.dx);
+    int crop_y = max_y / 2 - (int)lrintf(stab->cur.dy);
+    crop_x = ocr_clamp_i(crop_x, 0, max_x);
+    crop_y = ocr_clamp_i(crop_y, 0, max_y);
+    if (src->format == OCR_FMT_NV12) {
+        crop_x &= ~1;
+        crop_y &= ~1;
+    } else if (src->format == OCR_FMT_NV16 || src->format == OCR_FMT_YUYV) {
+        crop_x &= ~1;
     }
+    ret = ocr_rga_crop(src, dst, (uint32_t)crop_x, (uint32_t)crop_y,
+                       crop_w, crop_h);
 
     return ret;
 }

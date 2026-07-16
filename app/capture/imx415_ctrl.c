@@ -85,9 +85,8 @@ int ocr_imx415_set_ae(ocr_imx415_t *imx, int enable)
 int ocr_imx415_set_resolution(ocr_imx415_t *imx, uint32_t width, uint32_t height)
 {
     if (!imx || imx->v4l2_fd < 0) return -1;
-    /* 分辨率切换需重新 S_FMT，通常由 v4l2_capture 模块处理 */
-    /* TODO: 通过事件通知 v4l2_capture 重新协商格式 */
-    LOG_I("IMX415 分辨率切换请求: %ux%u（需重启采集流）", width, height);
+    LOG_W("IMX415 resolution %ux%u requires capture stream renegotiation",
+          width, height);
     (void)width; (void)height;
-    return 0;
+    return -ENOTSUP;
 }

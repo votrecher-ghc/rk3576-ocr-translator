@@ -2,7 +2,7 @@
 # ============================================================
 # RK3576 OCR 翻译系统 - 顶层构建入口
 # 用法: ./build.sh [target]
-#   target: all | kernel | app | models | rootfs | clean
+#   target: all | uboot | kernel | app | models | rootfs | image | clean
 # ============================================================
 
 set -e
@@ -13,6 +13,11 @@ TARGET="${1:-all}"
 build_kernel() {
     echo ">>> Building Linux Kernel..."
     bash "${PROJECT_ROOT}/scripts/build/build_kernel.sh"
+}
+
+build_uboot() {
+    echo ">>> Building U-Boot..."
+    bash "${PROJECT_ROOT}/scripts/build/build_uboot.sh"
 }
 
 build_app() {
@@ -38,18 +43,20 @@ make_image() {
 clean_all() {
     echo ">>> Cleaning..."
     rm -rf "${PROJECT_ROOT}/app/build"
-    rm -rf "${PROJECT_ROOT}/out"
+    rm -rf "${PROJECT_ROOT}/output"
     echo "Done."
 }
 
 case "${TARGET}" in
     all)
+        build_uboot
         build_kernel
         build_app
         build_models
         build_rootfs
         make_image
         ;;
+    uboot)   build_uboot ;;
     kernel)  build_kernel ;;
     app)     build_app ;;
     models)  build_models ;;
@@ -57,7 +64,7 @@ case "${TARGET}" in
     image)   make_image ;;
     clean)   clean_all ;;
     *)
-        echo "Usage: $0 {all|kernel|app|models|rootfs|image|clean}"
+        echo "Usage: $0 {all|uboot|kernel|app|models|rootfs|image|clean}"
         exit 1
         ;;
 esac

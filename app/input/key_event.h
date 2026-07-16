@@ -6,6 +6,7 @@
  */
 
 #include <stdint.h>
+#include <stddef.h>
 #include <stdatomic.h>
 #include "thread.h"
 
@@ -27,17 +28,23 @@ typedef enum {
 typedef struct {
     int          dev_fd;     /* /dev/input/eventX fd */
     char         dev_path[64];
-    atomic_int   running;    /* 监听线程运行标志 */
+    atomic_int   running;        /* worker 运行请求/当前运行状态 */
+    atomic_int   thread_started; /* thread handle 已创建且尚未 join */
+    atomic_int   worker_error;   /* worker 异常退出原因（负 errno） */
+    int          initialized;
     ocr_thread_t thread;
     /* 事件回调 */
     void       (*on_key)(ocr_key_event_t event, ocr_key_state_t state, void *user);
     void        *user_ctx;
 } ocr_key_event_t_ctx;
 
+/** Discover an input event device that advertises KEY_CAMERA. */
+int ocr_key_event_find_device(char *dev_path, size_t dev_path_size);
+
 /**
  * @brief 初始化按键事件监听
  * @param[in] ke       按键上下文
- * @param[in] dev_path input 设备路径（如 /dev/input/event0）
+ * @param[in] dev_path 动态发现的 input 设备路径（如 /dev/input/eventN）
  * @param[in] cb       按键回调
  * @param[in] user     用户上下文
  * @return 0=成功，负数=错误
@@ -55,6 +62,12 @@ int ocr_key_event_start(ocr_key_event_t_ctx *ke);
  * @brief 停止按键监听
  */
 int ocr_key_event_stop(ocr_key_event_t_ctx *ke);
+
+/** Return zero while healthy, or the negative worker error after an exit. */
+int ocr_key_event_get_worker_error(const ocr_key_event_t_ctx *ke);
+
+/** Return 1 only while the input worker is actively running. */
+int ocr_key_event_is_running(const ocr_key_event_t_ctx *ke);
 
 /**
  * @brief 销毁按键监听

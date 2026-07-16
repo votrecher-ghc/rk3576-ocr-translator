@@ -63,9 +63,9 @@
 #define ADT7410_DEVICE_ID_MASK		0xF0
 #define ADT7410_DEVICE_ID_VALUE		0xC0
 
-/* 温度分辨率: 16bit模式 0.0078°C/LSB */
-#define ADT7410_TEMP_SCALE_MILLI	7	/* scale * 1000 = 7.8125, 用7表示整数部分 */
-#define ADT7410_TEMP_SCALE_NUM		78125	/* scale = 0.0078125 °C/LSB (scale*1e6) */
+/* IIO 温度 ABI 以毫摄氏度表示换算后的值: 7.8125 m°C/LSB */
+#define ADT7410_TEMP_SCALE_NUM		125
+#define ADT7410_TEMP_SCALE_DEN		16
 
 /**
  * struct adt7410_data - ADT7410设备私有数据
@@ -136,21 +136,35 @@ static int adt7410_read_raw(struct iio_dev *indio_dev,
 		*val = (s16)ret;
 		return IIO_VAL_INT;
 
+	case IIO_CHAN_INFO_PROCESSED:
+		if (chan->type != IIO_TEMP)
+			return -EINVAL;
+
+		ret = adt7410_read_temp_raw(data);
+		if (ret < 0) {
+			dev_err(&data->client->dev, "读取温度失败: %d\n", ret);
+			return ret;
+		}
+
+		/* in_temp_input 单位为毫摄氏度，保留 1/16 m°C 精度 */
+		*val = (s16)ret * ADT7410_TEMP_SCALE_NUM;
+		*val2 = ADT7410_TEMP_SCALE_DEN;
+		return IIO_VAL_FRACTIONAL;
+
 	case IIO_CHAN_INFO_SCALE:
 		if (chan->type != IIO_TEMP)
 			return -EINVAL;
 
-		/* 16bit模式: 0.0078125 °C/LSB = 1/128 °C/LSB */
-		*val = 0;
-		*val2 = 7812; /* 0.0078125, 单位为°C, scale*1e6 = 7812.5 */
-		return IIO_VAL_INT_PLUS_MICRO;
+		/* (raw + offset) * scale 的单位为毫摄氏度 */
+		*val = ADT7410_TEMP_SCALE_NUM;
+		*val2 = ADT7410_TEMP_SCALE_DEN;
+		return IIO_VAL_FRACTIONAL;
 
 	case IIO_CHAN_INFO_OFFSET:
 		if (chan->type != IIO_TEMP)
 			return -EINVAL;
 
-		/* ADT7410 16bit模式: 温度 = raw / 128 (°C) */
-		/* 无偏移，直接为 raw * scale */
+		/* 无偏移: 温度(m°C) = (raw + 0) * 125 / 16 */
 		*val = 0;
 		return IIO_VAL_INT;
 
@@ -175,7 +189,8 @@ static const struct iio_chan_spec adt7410_channels[] = {
 		.type		= IIO_TEMP,
 		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |
 				      BIT(IIO_CHAN_INFO_SCALE) |
-				      BIT(IIO_CHAN_INFO_OFFSET),
+				      BIT(IIO_CHAN_INFO_OFFSET) |
+				      BIT(IIO_CHAN_INFO_PROCESSED),
 		.info_mask_shared_by_all = 0,
 		.datasheet_name	= "temp",
 	},
@@ -309,9 +324,8 @@ static int adt7410_probe(struct i2c_client *client,
  * adt7410_remove - I2C驱动移除函数
  * @client: I2C客户端
  *
- * 返回: 0
  */
-static int adt7410_remove(struct i2c_client *client)
+static void adt7410_remove(struct i2c_client *client)
 {
 	int config;
 
@@ -323,8 +337,6 @@ static int adt7410_remove(struct i2c_client *client)
 	}
 
 	dev_info(&client->dev, "ADT7410驱动卸载完成\n");
-
-	return 0;
 }
 
 #ifdef CONFIG_PM_SLEEP

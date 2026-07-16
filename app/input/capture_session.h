@@ -13,6 +13,7 @@
 #include "translator.h"
 #include "archiver.h"
 #include "key_event.h"
+#include <stdatomic.h>
 
 /** 拍照会话状态 */
 typedef enum {
@@ -32,7 +33,10 @@ typedef struct {
     ocr_translator_t   *translator; /* 翻译器 */
     ocr_archiver_t     *archiver;/* 归档器 */
     capture_session_state_t state; /* 当前状态 */
-    int                 busy;    /* 是否正在处理 */
+    atomic_int          busy;    /* 是否正在处理 */
+    char                src_lang[16];
+    char                tgt_lang[16];
+    int                 jpeg_quality;
 } ocr_capture_session_t;
 
 /**
@@ -42,6 +46,11 @@ int ocr_capture_session_init(ocr_capture_session_t *sess,
                              ocr_v4l2_capture_t *cap,
                              ocr_det_t *det, ocr_rec_t *rec,
                              ocr_translator_t *trs, ocr_archiver_t *arch);
+
+/** Configure archive language tags and JPEG quality. */
+int ocr_capture_session_configure(ocr_capture_session_t *sess,
+                                  const char *src_lang, const char *tgt_lang,
+                                  int jpeg_quality);
 
 /**
  * @brief 触发一次拍照（按键回调中调用）

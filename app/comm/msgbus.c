@@ -12,32 +12,62 @@
 #include <string.h>
 #include <sys/eventfd.h>
 #include <poll.h>
+#include <pthread.h>
+
+typedef struct {
+    ocr_ringbuffer_t ring;
+    pthread_mutex_t  producer_lock;
+} ocr_msgbus_priv_t;
+
+static int msgbus_pop(ocr_msgbus_t *bus, ocr_msg_t *msg)
+{
+    ocr_msgbus_priv_t *priv = (ocr_msgbus_priv_t *)bus->ring;
+    return priv ? ocr_ringbuffer_pop(&priv->ring, msg) : -1;
+}
+
+static void msgbus_consume_signal(ocr_msgbus_t *bus)
+{
+    uint64_t value;
+    ssize_t n;
+    do {
+        n = read(bus->eventfd, &value, sizeof(value));
+    } while (n < 0 && errno == EINTR);
+}
 
 int ocr_msgbus_init(ocr_msgbus_t *bus, size_t capacity)
 {
     if (!bus || capacity == 0) return -1;
     memset(bus, 0, sizeof(*bus));
+    bus->eventfd = -1;
+    bus->epoll_fd = -1;
 
     /* eventfd 用于唤醒消费者 */
-    bus->eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    bus->eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK | EFD_SEMAPHORE);
     if (bus->eventfd < 0) {
         LOG_E("eventfd 创建失败: %s", strerror(errno));
         return -2;
     }
 
-    /* 内部 SPSC 环形缓冲（多生产者需外部加锁，此处简化为单消费者） */
-    /* TODO: 真正 MPSC 需用互斥锁保护 push，或改用无锁 MPSC 队列 */
-    ocr_ringbuffer_t *ring = (ocr_ringbuffer_t *)malloc(sizeof(ocr_ringbuffer_t));
-    if (!ring) {
+    ocr_msgbus_priv_t *priv = (ocr_msgbus_priv_t *)calloc(1, sizeof(*priv));
+    if (!priv) {
         close(bus->eventfd);
+        bus->eventfd = -1;
         return -3;
     }
-    if (ocr_ringbuffer_init(ring, sizeof(ocr_msg_t), capacity) != 0) {
-        free(ring);
+    if (pthread_mutex_init(&priv->producer_lock, NULL) != 0) {
+        free(priv);
         close(bus->eventfd);
+        bus->eventfd = -1;
         return -4;
     }
-    bus->ring = ring;
+    if (ocr_ringbuffer_init(&priv->ring, sizeof(ocr_msg_t), capacity) != 0) {
+        pthread_mutex_destroy(&priv->producer_lock);
+        free(priv);
+        close(bus->eventfd);
+        bus->eventfd = -1;
+        return -5;
+    }
+    bus->ring = priv;
     bus->running = 1;
     return 0;
 }
@@ -47,8 +77,10 @@ void ocr_msgbus_destroy(ocr_msgbus_t *bus)
     if (!bus) return;
     bus->running = 0;
     if (bus->ring) {
-        ocr_ringbuffer_destroy((ocr_ringbuffer_t *)bus->ring);
-        free(bus->ring);
+        ocr_msgbus_priv_t *priv = (ocr_msgbus_priv_t *)bus->ring;
+        ocr_ringbuffer_destroy(&priv->ring);
+        pthread_mutex_destroy(&priv->producer_lock);
+        free(priv);
         bus->ring = NULL;
     }
     if (bus->eventfd >= 0) {
@@ -59,10 +91,12 @@ void ocr_msgbus_destroy(ocr_msgbus_t *bus)
 
 int ocr_msgbus_post(ocr_msgbus_t *bus, const ocr_msg_t *msg)
 {
-    if (!bus || !msg) return -1;
+    if (!bus || !msg || !bus->running || !bus->ring || bus->eventfd < 0) return -1;
 
-    /* TODO: 多生产者场景下需在此加锁 */
-    int ret = ocr_ringbuffer_push((ocr_ringbuffer_t *)bus->ring, msg);
+    ocr_msgbus_priv_t *priv = (ocr_msgbus_priv_t *)bus->ring;
+    pthread_mutex_lock(&priv->producer_lock);
+    int ret = ocr_ringbuffer_push(&priv->ring, msg);
+    pthread_mutex_unlock(&priv->producer_lock);
     if (ret != 0) {
         return ret;
     }
@@ -77,10 +111,11 @@ int ocr_msgbus_post(ocr_msgbus_t *bus, const ocr_msg_t *msg)
 
 int ocr_msgbus_recv(ocr_msgbus_t *bus, ocr_msg_t *msg, int timeout_ms)
 {
-    if (!bus || !msg) return -1;
+    if (!bus || !msg || !bus->running || !bus->ring || bus->eventfd < 0) return -1;
 
     /* 先尝试直接读 */
-    if (ocr_ringbuffer_pop((ocr_ringbuffer_t *)bus->ring, msg) == 0) {
+    if (msgbus_pop(bus, msg) == 0) {
+        msgbus_consume_signal(bus);
         return 0;
     }
 
@@ -93,19 +128,22 @@ int ocr_msgbus_recv(ocr_msgbus_t *bus, ocr_msg_t *msg, int timeout_ms)
     pfd.fd = bus->eventfd;
     pfd.events = POLLIN;
 
-    int pret = poll(&pfd, 1, timeout_ms);
+    int pret;
+    do {
+        pret = poll(&pfd, 1, timeout_ms);
+    } while (pret < 0 && errno == EINTR);
     if (pret <= 0) {
-        return 1; /* 超时或错误 */
+        return pret == 0 ? 1 : -2;
     }
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return -3;
 
     /* 清 eventfd 计数 */
     if (pfd.revents & POLLIN) {
-        uint64_t val;
-        read(bus->eventfd, &val, sizeof(val));
+        msgbus_consume_signal(bus);
     }
 
     /* 再次尝试取消息 */
-    if (ocr_ringbuffer_pop((ocr_ringbuffer_t *)bus->ring, msg) == 0) {
+    if (msgbus_pop(bus, msg) == 0) {
         return 0;
     }
     return 1;

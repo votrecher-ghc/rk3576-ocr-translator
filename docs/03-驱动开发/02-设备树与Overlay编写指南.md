@@ -1,213 +1,254 @@
-# 设备树与Overlay编写指南
+# 设备树与 Overlay 编写指南
 
-| 版本 | 日期       | 作者   | 变更说明 |
-| ---- | ---------- | ------ | -------- |
+| 版本 | 日期 | 作者 | 变更说明 |
+|---|---|---|---|
 | v1.0 | 2026-07-10 | 项目组 | 初始版本 |
+| v2.0 | 2026-07-16 | 项目组 | 对齐当前 overlay、互斥启用模式与板级核对边界 |
 
 ---
 
-## 目录
+## 1. 当前原则
 
-- [1. DTS 语法基础](#1-dts-语法基础)
-- [2. RK3576 DTS 组织](#2-rk3576-dts-组织)
-- [3. Overlay 机制](#3-overlay-机制)
-- [4. 各外设 DTS 片段](#4-各外设-dts-片段)
+仓库中的 overlay 是**项目侧适配候选**，不是已经在鲁班猫3实板确认的最终 DTS。
+所有 I2C/SPI/GPIO/PWM/CSI controller、pinctrl、IRQ 极性和 regulator 名称，都必须
+与目标 SDK 的 base DTS、原理图和 40Pin 引脚表逐项核对。
 
----
+默认构建和部署只使用 vendor base DTB。只有完成核对后，才显式选择一种 overlay
+启用方式：
 
-## 1. DTS 语法基础
+- `DT_OVERLAY_MODE=merged`
+- `DT_OVERLAY_MODE=vendor-resource`
 
-### 1.1 基本结构
+两种方式互斥，不能重复加载同一个设备节点。
 
-```dts
-/dts-v1/;
-/ {
-    node_name@address {
-        compatible = "vendor,device";
-        reg = <0x1e>;
-        status = "okay";
-        property = <value>;
-    };
-};
+## 2. 项目 overlay 清单
+
+目录：
+
+```text
+bsp/kernel/arch/arm64/boot/dts/rockchip/overlays/
+├── imx415-csi2.dtso
+├── ap3216c.dtso
+├── icm42688-spi.dtso
+├── adt7410.dtso
+├── pwm-fan.dtso
+└── gpio-keys.dtso
 ```
 
-### 1.2 常用属性
+| 文件 | 驱动匹配/用途 | 当前候选资源 | 状态 |
+|---|---|---|---|
+| `imx415-csi2.dtso` | `sony,imx415` | i2c4、CSI2 DPHY0、4 lane | 默认不构建；必须以出厂 media graph 为基线核对 |
+| `ap3216c.dtso` | `ocr,ap3216c` | i2c4@0x1e、GPIO0_PA1 falling | 待原理图/base DTS 核对 |
+| `icm42688-spi.dtso` | `ocr,icm42688` | spi0 CS0、24MHz、CPOL+CPHA、GPIO0_PB2 falling | 待 SPI mode/IRQ/pinctrl 核对 |
+| `adt7410.dtso` | `ocr,adt7410` | i2c4@0x48 | 待总线和 regulator 核对 |
+| `pwm-fan.dtso` | 用户态发现 marker `ocr,fan-pwm` | pwm11 | 待 PWM 通道、pinctrl、极性核对 |
+| `gpio-keys.dtso` | `ocr,gpio-keys` | GPIO0_PC0、active-low、`KEY_CAMERA` | 待物理引脚和上下拉核对 |
 
-| 属性        | 说明                       |
-| ----------- | -------------------------- |
-| compatible  | 兼容性字符串，匹配驱动     |
-| reg         | 寄存器地址/I2C 地址        |
-| interrupts  | 中断号                     |
-| clocks      | 时钟引用                   |
-| pinctrl-0   | 引脚复用配置               |
-| status      | "okay"/"disabled"          |
+## 3. Overlay 基本结构
 
-### 1.3 引用与覆盖
-
-```dts
-&i2c2 {
-    status = "okay";
-    // 添加子节点
-    new_device@1e { ... };
-};
-```
-
----
-
-## 2. RK3576 DTS 组织
-
-```
-arch/arm64/boot/dts/rockchip/
-├── rk3576.dtsi              // SoC 基础（CPU/中断/时钟/总线）
-├── rk3576-pinctrl.dtsi      // 引脚复用
-├── rk3576-lbc3.dts          // 鲁班猫3 板级
-└── overlays/
-    ├── Makefile
-    ├── imx415.dtso
-    ├── ap3216c.dtso
-    ├── icm42688.dtso
-    ├── adt7410.dtso
-    ├── pwm-fan.dtso
-    └── gpio-keys.dtso
-```
-
----
-
-## 3. Overlay 机制
-
-### 3.1 Overlay 文件格式
+项目采用 `/plugin/` + fragment 写法，例如：
 
 ```dts
 /dts-v1/;
 /plugin/;
 
-&i2c2 {
-    ap3216c@1e {
-        compatible = "lbc,ap3216c";
-        reg = <0x1e>;
-        status = "okay";
-    };
-};
-```
+/ {
+    compatible = "rockchip,rk3576";
 
-### 3.2 编译与加载
+    fragment@0 {
+        target = <&i2c4>;
 
-```bash
-# 编译
-dtc -@ -O dtb -o ap3216c.dtbo ap3216c.dtso
+        __overlay__ {
+            status = "okay";
 
-# 加载（运行时）
-mkdir -p /sys/kernel/config/device-tree/overlays/ap3216c
-cat ap3216c.dtbo > /sys/kernel/config/device-tree/overlays/ap3216c/dtbo
-```
-
----
-
-## 4. 各外设 DTS 片段
-
-### 4.1 IMX415（CSI）
-
-```dts
-&csi2_dphy0 {
-    status = "okay";
-    ports {
-        port@0 {
-            ep: endpoint {
-                remote-endpoint = <&imx415_out>;
-                data-lanes = <1 2 3 4>;
+            ap3216c@1e {
+                compatible = "ocr,ap3216c";
+                reg = <0x1e>;
+                status = "okay";
             };
         };
     };
 };
+```
 
-&i2c4 {
-    imx415: imx415@1a {
-        compatible = "sony,imx415";
-        reg = <0x1a>;
-        clocks = <&cru CLK_MIPI_CAMMOUT>;
-        reset-gpios = <&gpio3 RK_PA5 GPIO_ACTIVE_LOW>;
+`target` 引用的 label 必须确实存在于 vendor base DTS，并且 base DTB 构建时保留
+overlay 所需的符号信息。
+
+## 4. 当前外设片段
+
+以下片段只用于解释仓库当前契约；最终值以核对后的 overlay 文件为准。
+
+### 4.1 AP3216C
+
+```dts
+fragment@0 {
+    target = <&i2c4>;
+
+    __overlay__ {
+        status = "okay";
+
+        ap3216c: ap3216c@1e {
+            compatible = "ocr,ap3216c";
+            reg = <0x1e>;
+            interrupt-parent = <&gpio0>;
+            interrupts = <1 IRQ_TYPE_EDGE_FALLING>;
+            vdd-supply = <&vcc_3v3_s3>;
+            vled-supply = <&vcc_3v3_s3>;
+            status = "okay";
+        };
+    };
+};
+```
+
+### 4.2 ICM42688
+
+```dts
+fragment@0 {
+    target = <&spi0>;
+
+    __overlay__ {
+        status = "okay";
+
+        icm42688: icm42688@0 {
+            compatible = "ocr,icm42688";
+            reg = <0>;
+            spi-max-frequency = <24000000>;
+            spi-cpha;
+            spi-cpol;
+            interrupt-parent = <&gpio0>;
+            interrupts = <10 IRQ_TYPE_EDGE_FALLING>;
+            vdd-supply = <&vcc_3v3_s3>;
+            vddio-supply = <&vcc_1v8_s3>;
+            status = "okay";
+        };
+    };
+};
+```
+
+### 4.3 ADT7410
+
+```dts
+fragment@0 {
+    target = <&i2c4>;
+
+    __overlay__ {
+        status = "okay";
+
+        adt7410: adt7410@48 {
+            compatible = "ocr,adt7410";
+            reg = <0x48>;
+            #io-channel-cells = <1>;
+            vdd-supply = <&vcc_3v3_s3>;
+            status = "okay";
+        };
+    };
+};
+```
+
+### 4.4 用户态 PWM 风扇
+
+```dts
+fragment@0 {
+    target = <&pwm11>;
+
+    __overlay__ {
+        ocr,fan-pwm;
         status = "okay";
     };
 };
 ```
 
-### 4.2 AP3216C（I2C）
+`ocr,fan-pwm` 是无值发现 marker，不是 consumer compatible。当前应用通过 PWM
+sysfs 独占控制该通道，因此不能再在同一 PWM 上创建 `pwm-fan` 或
+`ocr,pwm-fan` consumer。
+
+### 4.5 OCR 拍照按键
 
 ```dts
-&i2c2 {
-    ap3216c@1e {
-        compatible = "lbc,ap3216c";
-        reg = <0x1e>;
-        interrupt-parent = <&gpio3>;
-        interrupts = <RK_PA1 IRQ_TYPE_EDGE_FALLING>;
-        status = "okay";
+fragment@0 {
+    target-path = "/";
+
+    __overlay__ {
+        ocr_gpio_keys: ocr-gpio-keys {
+            compatible = "ocr,gpio-keys";
+            label = "ocr-camera-key";
+            gpios = <&gpio0 16 GPIO_ACTIVE_LOW>;
+            linux,code = <KEY_CAMERA>;
+            debounce-interval = <20>;
+            status = "okay";
+        };
     };
 };
 ```
 
-### 4.3 ICM42688（SPI）
+用户态按 `EV_KEY + KEY_CAMERA` capability 查找事件设备，不依赖 `event0`。
 
-```dts
-&spi0 {
-    status = "okay";
-    icm42688@0 {
-        compatible = "inv,icm42688";
-        reg = <0>;
-        spi-max-frequency = <10000000>;
-        spi-cpha;
-        interrupt-parent = <&gpio4>;
-        interrupts = <RK_PA0 IRQ_TYPE_EDGE_RISING>;
-        status = "okay";
-    };
-};
+## 5. IMX415 特殊边界
+
+IMX415 不只是一个 I2C sensor 节点，还依赖：
+
+- sensor clock；
+- regulator；
+- reset/enable GPIO；
+- CSI2 DPHY；
+- CSI host；
+- RKCIF/RKISP media graph；
+- endpoint 和 lane/link-frequency；
+- vendor camera/ISP 配置。
+
+项目中的 `imx415-csi2.dtso` 未经目标 SDK 和实板验证，默认由
+`scripts/build/make_image.sh` 跳过。只有确认 vendor 出厂 DTS 无法直接满足需求，
+并完整核对 media graph 后，才设置：
+
+```bash
+export BUILD_UNVERIFIED_CAMERA_OVERLAY=1
 ```
 
-### 4.4 ADT7410（I2C）
+## 6. 构建与启用
 
-```dts
-&i2c2 {
-    adt7410@48 {
-        compatible = "adi,adt7410";
-        reg = <0x48>;
-        status = "okay";
-    };
-};
+推荐使用项目脚本，不手工复制未验证的 DTBO：
+
+```bash
+export KERNEL_SRC=/path/to/vendor-sdk/kernel-6.1
+bash scripts/build/build_kernel.sh
+
+export OCR_DTBO_LIST="ocr-ap3216c.dtbo ocr-adt7410.dtbo ocr-pwm-fan.dtbo"
+export DT_OVERLAY_MODE=merged
+bash scripts/build/make_image.sh
 ```
 
-### 4.5 PWM 风扇
+使用 vendor resource 路径时：
 
-```dts
-&pwm9 {
-    status = "okay";
-    fan: pwm-fan {
-        compatible = "pwm-fan";
-        cooling-cells = <2>;
-        pwms = <&pwm9 0 50000 0>;
-        cooling-levels = <0 30 60 80 100>;
-        #cooling-cells = <2>;
-        status = "okay";
-    };
-};
+```bash
+export DT_OVERLAY_MODE=vendor-resource
+export RK_PACK_SCRIPT=/path/to/vendor/pack-script
+bash scripts/build/make_image.sh
 ```
 
-### 4.6 按键（GPIO）
+## 7. 上板验收
 
-```dts
-gpio_keys: gpio-keys {
-    compatible = "gpio-keys";
-    pinctrl-0 = <&key_pin>;
+至少检查：
 
-    button_capture {
-        label = "Capture";
-        gpios = <&gpio0 RK_PA6 GPIO_ACTIVE_LOW>;
-        linux,code = <KEY_ENTER>;
-        debounce-interval = <10>;
-    };
-};
+```bash
+dmesg | grep -Ei 'ap3216c|adt7410|icm42688|gpio|pwm|deferred|conflict'
+find /sys/bus/iio/devices -maxdepth 2 -name name -exec sh -c 'printf "%s: " "$1"; cat "$1"' sh {} \;
+cat /proc/bus/input/devices
+media-ctl -p
+modetest -c -p
 ```
 
-> 详见各驱动开发详解文档。
+通过条件包括：
+
+- 没有重复节点、资源冲突或无法解释的 deferred probe；
+- IIO `name` 唯一；
+- `KEY_CAMERA` 唯一；
+- PWM 只有一个 owner；
+- overlay 启用前后 media graph 和显示拓扑符合预期。
 
 ---
 
-> 相关文档：[01-内核子系统概览.md](01-内核子系统概览.md)
+> 相关文档：
+>
+> - [按键驱动开发详解](03-按键驱动开发详解.md)
+> - [SDK 到板卡完整构建指南](../05-编译构建/09-SDK到板卡完整构建指南.md)
+> - [当前实现状态与板端验收清单](../07-测试/08-当前实现状态与板端验收清单.md)

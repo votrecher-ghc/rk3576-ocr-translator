@@ -8,15 +8,17 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
 
 /* 写 sysfs 整型值 */
 static int write_sysfs_int(const char *path, int val)
 {
     FILE *fp = fopen(path, "w");
     if (!fp) return -1;
-    fprintf(fp, "%d", val);
-    fclose(fp);
-    return 0;
+    int ret = fprintf(fp, "%d\n", val) < 0 ? -1 : 0;
+    if (fclose(fp) != 0) ret = -1;
+    return ret;
 }
 
 /* 读 sysfs 整型值 */
@@ -44,18 +46,26 @@ int ocr_brightness_init(ocr_brightness_t *ctrl, const char *sysfs_path)
 {
     if (!ctrl || !sysfs_path) return -1;
     memset(ctrl, 0, sizeof(*ctrl));
-    strncpy(ctrl->sysfs_path, sysfs_path, sizeof(ctrl->sysfs_path) - 1);
+    size_t len = strlen(sysfs_path);
+    const char suffix[] = "/brightness";
+    if (len >= sizeof(suffix) - 1 &&
+        strcmp(sysfs_path + len - (sizeof(suffix) - 1), suffix) == 0) {
+        len -= sizeof(suffix) - 1;
+    }
+    if (len == 0 || len >= sizeof(ctrl->sysfs_path)) return -2;
+    memcpy(ctrl->sysfs_path, sysfs_path, len);
+    ctrl->sysfs_path[len] = '\0';
     ctrl->hysteresis = 10;     /* 回差 10 级 */
     ctrl->smooth_alpha = 0.3f; /* 平滑系数 */
 
     /* 读取最大亮度 */
     char path[256];
-    snprintf(path, sizeof(path), "%s/max_brightness", sysfs_path);
+    snprintf(path, sizeof(path), "%s/max_brightness", ctrl->sysfs_path);
     ctrl->max_level = read_sysfs_int(path);
     if (ctrl->max_level <= 0) ctrl->max_level = BRIGHTNESS_MAX;
 
     /* 读取当前亮度 */
-    snprintf(path, sizeof(path), "%s/brightness", sysfs_path);
+    snprintf(path, sizeof(path), "%s/brightness", ctrl->sysfs_path);
     ctrl->cur_level = read_sysfs_int(path);
     if (ctrl->cur_level < 0) ctrl->cur_level = ctrl->max_level / 2;
 
@@ -66,7 +76,7 @@ int ocr_brightness_init(ocr_brightness_t *ctrl, const char *sysfs_path)
 
 int ocr_brightness_update(ocr_brightness_t *ctrl, int lux)
 {
-    if (!ctrl) return -1;
+    if (!ctrl || lux < 0) return -1;
     int new_target = lux_to_level(lux, ctrl->max_level);
 
     /* 回差：目标变化小于阈值时不调整 */
@@ -76,15 +86,26 @@ int ocr_brightness_update(ocr_brightness_t *ctrl, int lux)
     ctrl->target_level = new_target;
 
     /* 平滑过渡 */
-    ctrl->cur_level = (int)(ocr_lowpass((float)ctrl->cur_level,
-                                        (float)ctrl->target_level,
-                                        ctrl->smooth_alpha) + 0.5f);
-    ctrl->cur_level = ocr_clamp_i(ctrl->cur_level, 0, ctrl->max_level);
+    int previous = ctrl->cur_level;
+    int next = (int)(ocr_lowpass((float)previous,
+                                 (float)ctrl->target_level,
+                                 ctrl->smooth_alpha) + 0.5f);
+    if (next == previous && next != ctrl->target_level) {
+        next += next < ctrl->target_level ? 1 : -1;
+    }
+    ctrl->cur_level = ocr_clamp_i(next, 0, ctrl->max_level);
+
+    if (ctrl->cur_level == previous) return 0;
 
     /* 写入背光 */
     char path[256];
     snprintf(path, sizeof(path), "%s/brightness", ctrl->sysfs_path);
-    return write_sysfs_int(path, ctrl->cur_level);
+    if (write_sysfs_int(path, ctrl->cur_level) != 0) {
+        ctrl->cur_level = previous;
+        LOG_W("写入背光亮度失败: %s (%s)", path, strerror(errno));
+        return -2;
+    }
+    return 0;
 }
 
 int ocr_brightness_set(ocr_brightness_t *ctrl, int level)

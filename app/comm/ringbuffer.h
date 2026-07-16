@@ -17,7 +17,8 @@ typedef struct {
     uint8_t        *buf;        /* 底层缓冲区 */
     size_t          capacity;   /* 总字节容量 */
     size_t          elem_size;  /* 单元素字节大小 */
-    size_t          count;      /* 元素个数（=capacity/elem_size） */
+    size_t          count;      /* 可用元素个数（=capacity/elem_size） */
+    size_t          mask;       /* count 为 2 的幂时使用的快速索引掩码 */
     atomic_size_t   head;       /* 生产者写位置 */
     atomic_size_t   tail;       /* 消费者读位置 */
 } ocr_ringbuffer_t;

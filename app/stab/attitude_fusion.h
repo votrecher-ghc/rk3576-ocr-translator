@@ -27,8 +27,9 @@ typedef struct {
     quaternion_t q;       /* 当前四元数 */
     float beta;           /* Madgwick 滤波增益 */
     float sample_dt;      /* 采样间隔（秒） */
-    float accel_scale;    /* 加速度缩放（→ m/s^2） */
-    float gyro_scale;     /* 陀螺仪缩放（→ rad/s） */
+    float accel_scale;    /* 兼容字段；update 输入已是 SI，固定为 1 */
+    float gyro_scale;     /* 兼容字段；update 输入已是 SI，固定为 1 */
+    float max_dt;         /* 可接受的最大单次时间跨度（秒） */
 } ocr_attitude_t;
 
 /**
@@ -44,7 +45,7 @@ int ocr_attitude_init(ocr_attitude_t *att, float sample_hz, float beta);
  * @param[in] att    姿态上下文
  * @param[in] accel  加速度（m/s^2）
  * @param[in] gyro   陀螺仪（rad/s）
- * @param[in] dt     时间步长（秒）
+ * @param[in] dt     时间步长（秒）；0 使用初始化时的 sample_dt
  */
 int ocr_attitude_update(ocr_attitude_t *att, const float accel[3],
                         const float gyro[3], float dt);

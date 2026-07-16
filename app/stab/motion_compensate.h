@@ -17,6 +17,9 @@ typedef struct {
     float   hfov_deg;      /* 水平视场角（度） */
     float   vfov_deg;      /* 垂直视场角（度） */
     float   alpha;         /* 低通滤波系数 */
+    float   max_shift_ratio; /* 单轴最大平移占图像尺寸的比例 */
+    float   max_angle_deg;   /* 单帧最大旋转补偿角 */
+    float   max_scale;       /* 最大裁剪放大系数 */
     ocr_stab_params_t filtered; /* 滤波后补偿参数 */
 } ocr_motion_comp_t;
 

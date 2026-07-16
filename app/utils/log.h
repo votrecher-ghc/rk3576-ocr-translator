@@ -16,6 +16,8 @@ typedef enum {
     LOG_LEVEL_FATAL,
 } log_level_t;
 
+/* FATAL 仅表示最高严重级别；进程退出与资源清理由调用方决定。 */
+
 /**
  * @brief 初始化日志系统
  * @param[in] name   模块名（打印前缀）

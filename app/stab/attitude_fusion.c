@@ -1,94 +1,144 @@
 /**
  * @file attitude_fusion.c
- * @brief Madgwick 姿态融合实现
+ * @brief Numerically guarded six-axis Madgwick attitude fusion.
  */
 #include "attitude_fusion.h"
 #include "math_utils.h"
-#include "log.h"
 
-#include <string.h>
 #include <math.h>
+#include <string.h>
 
-int ocr_attitude_init(ocr_attitude_t *att, float sample_hz, float beta)
+#define OCR_ATTITUDE_EPSILON       1.0e-9f
+#define OCR_ATTITUDE_MAX_SAMPLE_HZ 100000.0f
+#define OCR_ATTITUDE_MAX_STEPS     256
+
+static int quaternion_normalize(quaternion_t *q)
 {
-    if (!att) return -1;
-    memset(att, 0, sizeof(*att));
-    att->q.w = 1.0f; /* 单位四元数 */
-    att->q.x = att->q.y = att->q.z = 0.0f;
-    att->beta = beta;
-    att->sample_dt = 1.0f / sample_hz;
-    att->accel_scale = 9.80665f / 1000.0f; /* 假设原始为 mg */
-    att->gyro_scale = (float)M_PI / 180.0f / 1000.0f; /* 假设原始为 mdps */
+    float norm;
+
+    if (!q || !isfinite(q->w) || !isfinite(q->x) ||
+        !isfinite(q->y) || !isfinite(q->z)) {
+        return -1;
+    }
+    norm = hypotf(hypotf(q->w, q->x), hypotf(q->y, q->z));
+    if (!isfinite(norm) || norm <= OCR_ATTITUDE_EPSILON) return -1;
+    q->w /= norm;
+    q->x /= norm;
+    q->y /= norm;
+    q->z /= norm;
     return 0;
 }
 
-/* 快速倒数平方根（Madgwick 原版算法使用） */
-static float inv_sqrt(float x)
+int ocr_attitude_init(ocr_attitude_t *att, float sample_hz, float beta)
 {
-    return 1.0f / sqrtf(x);
+    if (!att || !isfinite(sample_hz) || sample_hz <= 0.0f ||
+        sample_hz > OCR_ATTITUDE_MAX_SAMPLE_HZ ||
+        !isfinite(beta) || beta < 0.0f) {
+        return -1;
+    }
+    memset(att, 0, sizeof(*att));
+    att->q.w = 1.0f;
+    att->beta = beta;
+    att->sample_dt = 1.0f / sample_hz;
+    att->accel_scale = 1.0f;
+    att->gyro_scale = 1.0f;
+    att->max_dt = 0.25f;
+    return 0;
+}
+
+static int attitude_step(ocr_attitude_t *att, const float accel[3],
+                         const float gyro[3], float dt)
+{
+    float q0 = att->q.w;
+    float q1 = att->q.x;
+    float q2 = att->q.y;
+    float q3 = att->q.z;
+    float gx = gyro[0];
+    float gy = gyro[1];
+    float gz = gyro[2];
+    float q_dot0 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
+    float q_dot1 = 0.5f * ( q0 * gx + q2 * gz - q3 * gy);
+    float q_dot2 = 0.5f * ( q0 * gy - q1 * gz + q3 * gx);
+    float q_dot3 = 0.5f * ( q0 * gz + q1 * gy - q2 * gx);
+    float accel_norm = hypotf(hypotf(accel[0], accel[1]), accel[2]);
+
+    /* With no usable gravity vector, gyro integration remains well-defined. */
+    if (isfinite(accel_norm) && accel_norm > OCR_ATTITUDE_EPSILON) {
+        float ax = accel[0] / accel_norm;
+        float ay = accel[1] / accel_norm;
+        float az = accel[2] / accel_norm;
+        float _2q0 = 2.0f * q0;
+        float _2q1 = 2.0f * q1;
+        float _2q2 = 2.0f * q2;
+        float _2q3 = 2.0f * q3;
+        float _4q0 = 4.0f * q0;
+        float _4q1 = 4.0f * q1;
+        float _4q2 = 4.0f * q2;
+        float _8q1 = 8.0f * q1;
+        float _8q2 = 8.0f * q2;
+        float q0q0 = q0 * q0;
+        float q1q1 = q1 * q1;
+        float q2q2 = q2 * q2;
+        float q3q3 = q3 * q3;
+        float s0 = _4q0 * q2q2 + _2q2 * ax +
+                   _4q0 * q1q1 - _2q1 * ay;
+        float s1 = _4q1 * q3q3 - _2q3 * ax +
+                   4.0f * q0q0 * q1 - _2q0 * ay - _4q1 +
+                   _8q1 * q1q1 + _8q1 * q2q2 + _4q1 * az;
+        float s2 = 4.0f * q0q0 * q2 + _2q0 * ax +
+                   _4q2 * q3q3 - _2q3 * ay - _4q2 +
+                   _8q2 * q1q1 + _8q2 * q2q2 + _4q2 * az;
+        float s3 = 4.0f * q1q1 * q3 - _2q1 * ax +
+                   4.0f * q2q2 * q3 - _2q2 * ay;
+        float step_norm = hypotf(hypotf(s0, s1), hypotf(s2, s3));
+
+        if (isfinite(step_norm) && step_norm > OCR_ATTITUDE_EPSILON) {
+            float gain = att->beta / step_norm;
+            q_dot0 -= gain * s0;
+            q_dot1 -= gain * s1;
+            q_dot2 -= gain * s2;
+            q_dot3 -= gain * s3;
+        }
+    }
+
+    att->q.w = q0 + q_dot0 * dt;
+    att->q.x = q1 + q_dot1 * dt;
+    att->q.y = q2 + q_dot2 * dt;
+    att->q.z = q3 + q_dot3 * dt;
+    return quaternion_normalize(&att->q);
 }
 
 int ocr_attitude_update(ocr_attitude_t *att, const float accel[3],
                         const float gyro[3], float dt)
 {
+    int steps;
+    float step_dt;
+
     if (!att || !accel || !gyro) return -1;
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!isfinite(accel[axis]) || !isfinite(gyro[axis])) return -1;
+    }
+    if (!isfinite(dt) || dt < 0.0f) return -2;
+    if (dt == 0.0f) dt = att->sample_dt;
+    if (!isfinite(att->sample_dt) || att->sample_dt <= 0.0f ||
+        !isfinite(att->max_dt) || att->max_dt <= 0.0f || dt > att->max_dt) {
+        return -2;
+    }
+    if (quaternion_normalize(&att->q) != 0) {
+        ocr_attitude_reset(att);
+        return -3;
+    }
 
-    float ax = accel[0], ay = accel[1], az = accel[2];
-    float gx = gyro[0],  gy = gyro[1],  gz = gyro[2];
-
-    float qw = att->q.w, qx = att->q.x, qy = att->q.y, qz = att->q.z;
-
-    /* 归一化加速度 */
-    float norm = inv_sqrt(ax * ax + ay * ay + az * az);
-    ax *= norm; ay *= norm; az *= norm;
-
-    /* 梯度下降算法修正（Madgwick） */
-    float _2qw = 2.0f * qw;
-    float _2qx = 2.0f * qx;
-    float _2qy = 2.0f * qy;
-    float _2qz = 2.0f * qz;
-    float _4qw = 4.0f * qw;
-    float _4qx = 4.0f * qx;
-    float _4qy = 4.0f * qy;
-    float _8qx = 8.0f * qx;
-    float _8qy = 8.0f * qy;
-    float qwqw = qw * qw, qxqx = qx * qx, qyqy = qy * qy, qzqz = qz * qz;
-
-    /* 误差向量（叉积） */
-    float sx = _2qy * (2.0f * qx * qz - _2qy * qw) - _2qz * (2.0f * qx * qy + _2qz * qw) + az;
-    float sy = _2qx * (2.0f * qy * qz + _2qx * qw) - _2qw * (2.0f * qx * qz - _2qy * qw) - _2qz * (2.0f * qx * qw + _2qz * qx) - az;
-    float sz = _2qw * (2.0f * qx * qy + _2qz * qw) + _2qx * (2.0f * qy * qz + _2qx * qw) - _2qy * (2.0f * qx * qw - _2qz * qx) + ax;
-
-    /* 归一化误差 */
-    norm = inv_sqrt(sx * sx + sy * sy + sz * sz);
-    sx *= norm; sy *= norm; sz *= norm;
-
-    /* 反馈梯度 */
-    float step = att->beta;
-    sx *= step; sy *= step; sz *= step;
-
-    /* 陀螺仪漂移修正 */
-    gx += sx; gy += sy; gz += sz;
-
-    /* 四元数微分积分 */
-    float dqw = (-qx * gx - qy * gy - qz * gz) * 0.5f;
-    float dqx = ( qw * gx + qy * gz - qz * gy) * 0.5f;
-    float dqy = ( qw * gy - qx * gz + qz * gx) * 0.5f;
-    float dqz = ( qw * gz + qx * gy - qy * gx) * 0.5f;
-
-    att->q.w += dqw * dt;
-    att->q.x += dqx * dt;
-    att->q.y += dqy * dt;
-    att->q.z += dqz * dt;
-
-    /* 归一化四元数 */
-    norm = inv_sqrt(att->q.w * att->q.w + att->q.x * att->q.x +
-                    att->q.y * att->q.y + att->q.z * att->q.z);
-    att->q.w *= norm;
-    att->q.x *= norm;
-    att->q.y *= norm;
-    att->q.z *= norm;
-
+    steps = (int)ceilf(dt / att->sample_dt);
+    if (steps < 1) steps = 1;
+    if (steps > OCR_ATTITUDE_MAX_STEPS) steps = OCR_ATTITUDE_MAX_STEPS;
+    step_dt = dt / (float)steps;
+    for (int step = 0; step < steps; ++step) {
+        if (attitude_step(att, accel, gyro, step_dt) != 0) {
+            ocr_attitude_reset(att);
+            return -3;
+        }
+    }
     return 0;
 }
 
@@ -96,31 +146,36 @@ int ocr_attitude_update_9dof(ocr_attitude_t *att, const float accel[3],
                              const float gyro[3], const float mag[3], float dt)
 {
     if (!att || !accel || !gyro || !mag) return -1;
-    /* TODO: 实现 9 轴 Madgwick 滤波（加入磁力计修正 yaw 漂移） */
-    /* 当前回退到 6 轴 */
+    /* Magnetometer correction is not yet part of the EIS data path. */
     return ocr_attitude_update(att, accel, gyro, dt);
 }
 
 void ocr_attitude_to_euler(const ocr_attitude_t *att, euler_t *euler)
 {
-    if (!att || !euler) return;
-    float qw = att->q.w, qx = att->q.x, qy = att->q.y, qz = att->q.z;
+    quaternion_t q;
+    float sinr;
+    float cosr;
+    float sinp;
+    float siny;
+    float cosy;
 
-    /* roll (x-axis rotation) */
-    float sinr = 2.0f * (qw * qx + qy * qz);
-    float cosr = 1.0f - 2.0f * (qx * qx + qy * qy);
+    if (!att || !euler) return;
+    q = att->q;
+    if (quaternion_normalize(&q) != 0) {
+        memset(euler, 0, sizeof(*euler));
+        return;
+    }
+
+    sinr = 2.0f * (q.w * q.x + q.y * q.z);
+    cosr = 1.0f - 2.0f * (q.x * q.x + q.y * q.y);
     euler->roll = ocr_rad2deg(atan2f(sinr, cosr));
 
-    /* pitch (y-axis rotation) */
-    float sinp = 2.0f * (qw * qy - qz * qx);
-    if (fabsf(sinp) >= 1.0f)
-        euler->pitch = ocr_rad2deg(copysignf((float)M_PI / 2.0f, sinp));
-    else
-        euler->pitch = ocr_rad2deg(asinf(sinp));
+    sinp = 2.0f * (q.w * q.y - q.z * q.x);
+    sinp = ocr_clamp_f(sinp, -1.0f, 1.0f);
+    euler->pitch = ocr_rad2deg(asinf(sinp));
 
-    /* yaw (z-axis rotation) */
-    float siny = 2.0f * (qw * qz + qx * qy);
-    float cosy = 1.0f - 2.0f * (qy * qy + qz * qz);
+    siny = 2.0f * (q.w * q.z + q.x * q.y);
+    cosy = 1.0f - 2.0f * (q.y * q.y + q.z * q.z);
     euler->yaw = ocr_rad2deg(atan2f(siny, cosy));
 }
 
@@ -128,5 +183,7 @@ void ocr_attitude_reset(ocr_attitude_t *att)
 {
     if (!att) return;
     att->q.w = 1.0f;
-    att->q.x = att->q.y = att->q.z = 0.0f;
+    att->q.x = 0.0f;
+    att->q.y = 0.0f;
+    att->q.z = 0.0f;
 }

@@ -6,10 +6,18 @@
  */
 
 #include <stdint.h>
-#include <cjson/cJSON.h>
+#include <stddef.h>
 
 #define ARCHIVE_PATH_LEN 512
 #define ARCHIVE_MAX_TEXT 4096
+
+/** 与 AI 模块解耦的四点文本框序列化格式。 */
+typedef struct {
+    float x[4];
+    float y[4];
+    float score;
+    int   valid;
+} ocr_archive_box_t;
 
 /** 单次归档结果 */
 typedef struct {
@@ -55,13 +63,13 @@ int ocr_archiver_save_text(ocr_archive_entry_t *entry, const char *text, const c
 /**
  * @brief 保存 JSON 结果（result.json，含框坐标+原文+译文）
  * @param[in] entry    归档条目
- * @param[in] boxes    文本框列表
+ * @param[in] boxes    ocr_archive_box_t 数组（可为 NULL）
  * @param[in] texts    原文数组
  * @param[in] trans    译文数组
  * @param[in] count    条目数
  * @return 0=成功，负数=错误
  */
-int ocr_archiver_save_json(ocr_archive_entry_t *entry, const void *boxes,
+int ocr_archiver_save_json(ocr_archive_entry_t *entry, const ocr_archive_box_t *boxes,
                            char **texts, char **trans, int count);
 
 /**

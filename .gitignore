@@ -3,6 +3,8 @@
 *.ko
 *.mod
 *.mod.c
+*.pyc
+__pycache__/
 Module.symvers
 modules.order
 .tmp_versions/
@@ -11,6 +13,10 @@ modules.order
 build/
 out/
 output/
+
+# scripts/build contains maintained build entry points, not generated files.
+!scripts/build/
+!scripts/build/*.sh
 
 # IDE files
 .vscode/

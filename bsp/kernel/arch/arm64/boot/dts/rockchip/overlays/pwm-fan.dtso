@@ -1,17 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * pwm-fan.dtso - PWM风扇温控DTS Overlay
+ * pwm-fan.dtso - 用户态 PWM 风扇 DTS Overlay
  *
- * 描述: PWM风扇驱动配置，使用pwm11通道。
- *       四档温控（3个温度阈值 + 4个占空比）:
- *         档位0(OFF):  温度 < 40°C,  PWM占空比 = 0
- *         档位1(LOW):  温度 >= 40°C, PWM占空比 = 128
- *         档位2(MID):  温度 >= 55°C, PWM占空比 = 200
- *         档位3(HIGH): 温度 >= 70°C, PWM占空比 = 255
- *       回差: 3°C (防止温度在阈值附近频繁切换)
- *
- * 注意: pwm-duties数组元素数量 = temp-levels数组元素数量 + 1
- *       第0个pwm-duties对应低于首个温度阈值时的占空比
+ * 描述: 只启用 pwm11 控制器。ocr_translator 通过 PWM sysfs export、
+ *       period/duty_cycle/enable 完成四档调速。这里不能再创建
+ *       ocr,pwm-fan consumer，否则内核会独占同一 PWM，用户态无法控制。
  *
  * 作者: OCR Team <ocr@example.com>
  * 许可证: GPL-2.0
@@ -30,63 +23,10 @@
 		target = <&pwm11>;
 
 		__overlay__ {
+			/* Userspace discovers the dynamically numbered pwmchip by this marker. */
+			ocr,fan-pwm;
 			status = "okay";
 		};
 	};
 
-	fragment@1 {
-		target-path = "/";
-
-		__overlay__ {
-			/* PWM风扇温控节点 */
-			pwm_fan_ocr: pwm-fan-ocr {
-				compatible = "ocr,pwm-fan";
-
-				/* PWM通道引用 */
-				pwms = <&pwm11 0 50000 0>;
-
-				/* 散热单元数（用于thermal-zone引用） */
-				#cooling-cells = <2>;
-
-				/*
-				 * 温度阈值数组（毫摄氏度）
-				 * 档位0: < 40°C -> OFF
-				 * 档位1: >= 40°C -> LOW
-				 * 档位2: >= 55°C -> MID
-				 * 档位3: >= 70°C -> HIGH
-				 */
-				temp-levels = <40000 55000 70000>;
-
-				/*
-				 * 对应的PWM占空比（0-255）
-				 * 档位0: PWM = 0 (关闭)
-				 * 档位1: PWM = 128 (约50%)
-				 * 档位2: PWM = 200 (约78%)
-				 * 档位3: PWM = 255 (100%)
-				 */
-				pwm-duties = <0 128 200 255>;
-
-				/* 回差温度: 3000m°C (3°C) */
-				hysteresis = <3000>;
-
-				/* 温度采样间隔: 2000ms */
-				sample-interval-ms = <2000>;
-
-				status = "okay";
-			};
-		};
-	};
-
-	/*
-	 * 可选: 配置thermal-zone引用PWM风扇
-	 * 需要ADT7410的IIO通道提供温度数据
-	 */
-	fragment@2 {
-		target = <&thermal_zones>;
-
-		__overlay__ {
-			/* 此处可根据实际需求配置thermal-zone */
-			/* 当前由驱动自身管理温度采样和风扇控制 */
-		};
-	};
 };

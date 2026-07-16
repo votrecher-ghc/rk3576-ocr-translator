@@ -19,58 +19,76 @@
 
 #include <linux/module.h>
 #include <linux/kernel.h>
-#include <linux/init.h>
+#include <linux/bits.h>
 #include <linux/i2c.h>
 #include <linux/iio/iio.h>
-#include <linux/iio/sysfs.h>
 #include <linux/delay.h>
-#include <linux/irq.h>
 #include <linux/interrupt.h>
 #include <linux/of.h>
-#include <linux/of_irq.h>
-#include <linux/of_gpio.h>
-#include <linux/gpio.h>
-#include <linux/regmap.h>
 #include <linux/pm.h>
 
 /* 驱动兼容字符串 */
 #define AP3216C_DRV_NAME	"ocr,ap3216c"
 
-/* AP3216C I2C地址 */
-#define AP3216C_I2C_ADDR	0x1E
-
 /* 寄存器定义 */
 #define AP3216C_SYS_CONFIG	0x00	/* 系统配置寄存器 */
 #define AP3216C_INT_STATUS	0x01	/* 中断状态寄存器 */
-#define AP3216C_INT_CFG		0x02	/* 中断配置寄存器 */
-#define AP3216C_PS_CFG		0x03	/* PS配置寄存器 */
-#define AP3216C_PS_LED		0x05	/* PS LED配置寄存器 */
-#define AP3216C_PS_THDL		0x08	/* PS低阈值寄存器 */
-#define AP3216C_PS_THDH		0x09	/* PS高阈值寄存器 */
-#define AP3216C_ALS_CFG		0x10	/* ALS配置寄存器 */
-#define AP3216C_ALS_THDL	0x1C	/* ALS低阈值寄存器 */
-#define AP3216C_ALS_THDH	0x1D	/* ALS高阈值寄存器 */
-#define AP3216C_PS_DATA_LOW	0x0A	/* PS数据低字节 */
-#define AP3216C_PS_DATA_HIGH	0x0B	/* PS数据高字节 */
+#define AP3216C_INT_CLEAR_MANNER	0x02	/* 中断清除方式寄存器 */
+#define AP3216C_IR_DATA_LOW	0x0A	/* IR数据低字节 */
+#define AP3216C_IR_DATA_HIGH	0x0B	/* IR数据高字节 */
 #define AP3216C_ALS_DATA_LOW	0x0C	/* ALS数据低字节 */
 #define AP3216C_ALS_DATA_HIGH	0x0D	/* ALS数据高字节 */
+#define AP3216C_PS_DATA_LOW	0x0E	/* PS数据低字节 */
+#define AP3216C_PS_DATA_HIGH	0x0F	/* PS数据高字节 */
+#define AP3216C_ALS_CFG		0x10	/* ALS配置寄存器 */
+#define AP3216C_ALS_CALIBRATION	0x19	/* ALS校准寄存器 */
+#define AP3216C_ALS_THD_LOW_L	0x1A	/* ALS低阈值低字节 */
+#define AP3216C_ALS_THD_LOW_H	0x1B	/* ALS低阈值高字节 */
+#define AP3216C_ALS_THD_HIGH_L	0x1C	/* ALS高阈值低字节 */
+#define AP3216C_ALS_THD_HIGH_H	0x1D	/* ALS高阈值高字节 */
+#define AP3216C_PS_CFG		0x20	/* PS配置寄存器 */
+#define AP3216C_PS_LED		0x21	/* PS LED配置寄存器 */
+#define AP3216C_PS_INT_MODE	0x22	/* PS中断算法寄存器 */
+#define AP3216C_PS_MEAN_TIME	0x23	/* PS平均时间寄存器 */
+#define AP3216C_PS_WAIT_TIME	0x24	/* PS等待时间寄存器 */
+#define AP3216C_PS_CALIBRATION_L	0x28	/* PS校准低字节 */
+#define AP3216C_PS_CALIBRATION_H	0x29	/* PS校准高字节 */
+#define AP3216C_PS_THD_LOW_L	0x2A	/* PS低阈值低字节 */
+#define AP3216C_PS_THD_LOW_H	0x2B	/* PS低阈值高字节 */
+#define AP3216C_PS_THD_HIGH_L	0x2C	/* PS高阈值低字节 */
+#define AP3216C_PS_THD_HIGH_H	0x2D	/* PS高阈值高字节 */
 
 /* 系统配置模式 */
 #define AP3216C_MODE_POWERDOWN		0x00	/* 关断模式 */
 #define AP3216C_MODE_ALS_ONLY		0x01	/* 仅ALS */
-#define AP3216C_MODE_PS_ONLY		0x02	/* 仅PS */
-#define AP3216C_MODE_ALS_PS		0x03	/* ALS+PS */
+#define AP3216C_MODE_PS_ONLY		0x02	/* PS+IR */
+#define AP3216C_MODE_ALS_PS		0x03	/* ALS+PS+IR */
 #define AP3216C_MODE_SW_RESET		0x04	/* 软件复位 */
-#define AP3216C_MODE_ALS_PS_IRQ		0x07	/* ALS+PS带中断 */
+#define AP3216C_MODE_ALS_ONCE		0x05	/* 单次ALS */
+#define AP3216C_MODE_PS_ONCE		0x06	/* 单次PS+IR */
+#define AP3216C_MODE_ALS_PS_ONCE		0x07	/* 单次ALS+PS+IR */
 
-/* PS数据有效位（0x0B[0:3]为PS_DATA，共12bit） */
-#define AP3216C_PS_DATA_MASK		0x0F
-#define AP3216C_PS_DATA_SHIFT		8
-/* PS数据有效标志位 */
-#define AP3216C_PS_DATA_VALID		0x40
+/* 中断状态与清除方式 */
+#define AP3216C_INT_ALS			BIT(0)
+#define AP3216C_INT_PS			BIT(1)
+#define AP3216C_INT_MASK		(AP3216C_INT_ALS | AP3216C_INT_PS)
+#define AP3216C_INT_CLEAR_AUTO		0x00
+#define AP3216C_INT_CLEAR_SW		BIT(0)
+
+/* PS数据为10bit：0x0F[5:0] << 4 | 0x0E[3:0]。 */
+#define AP3216C_PS_DATA_LOW_MASK	GENMASK(3, 0)
+#define AP3216C_PS_DATA_HIGH_MASK	GENMASK(5, 0)
+#define AP3216C_PS_DATA_HIGH_SHIFT	4
+#define AP3216C_PS_IR_OVERFLOW		BIT(6)
+
+/* Rev0.86寄存器默认值。 */
+#define AP3216C_PS_CFG_DEFAULT		0x05
+#define AP3216C_PS_LED_DEFAULT		0x13
 
 /* ALS数据16bit（0x0D高8bit，0x0C低8bit） */
 #define AP3216C_ALS_DATA_SHIFT		8
+/* ALS_CFG=0x00 的默认量程：0.35 lux/LSB（0~20661 lux） */
+#define AP3216C_ALS_SCALE_MICRO		350000
 
 /* 驱动启动后等待芯片稳定的延时（ms） */
 #define AP3216C_STARTUP_DELAY_MS	100
@@ -80,13 +98,11 @@
  * @client:  I2C客户端指针
  * @lock:    数据访问互斥锁
  * @irq:     中断号（0表示不使用中断）
- * @int_gpio: 中断GPIO编号
  */
 struct ap3216c_data {
 	struct i2c_client *client;
 	struct mutex lock;
 	int irq;
-	int int_gpio;
 };
 
 /**
@@ -152,10 +168,10 @@ out_unlock:
  * ap3216c_read_ps - 读取接近数据
  * @data: 设备私有数据
  *
- * PS数据为12位：高字节(0x0B)低4位 << 8 | 低字节(0x0A)
- * 需检查0x0B的bit6（数据有效标志）。
+ * PS数据为10位：高字节(0x0F)低6位 << 4 | 低字节(0x0E)低4位。
+ * 0x0E/0x0F的bit6为IR_OF；置位表示强红外下PS数据无效。
  *
- * 返回: 接近原始值（0-4095），负数错误码
+ * 返回: 接近原始值（0-1023），负数错误码
  */
 static int ap3216c_read_ps(struct ap3216c_data *data)
 {
@@ -176,14 +192,14 @@ static int ap3216c_read_ps(struct ap3216c_data *data)
 		goto out_unlock;
 	}
 
-	/* 检查数据有效标志 */
-	if (high & AP3216C_PS_DATA_VALID) {
-		/* 提取12位PS数据 */
-		ret = ((high & AP3216C_PS_DATA_MASK) << AP3216C_PS_DATA_SHIFT) | low;
-	} else {
-		/* 数据无效，返回0 */
-		ret = 0;
+	if ((low | high) & AP3216C_PS_IR_OVERFLOW) {
+		ret = -EOVERFLOW;
+		goto out_unlock;
 	}
+
+	ret = ((high & AP3216C_PS_DATA_HIGH_MASK) <<
+	       AP3216C_PS_DATA_HIGH_SHIFT) |
+	      (low & AP3216C_PS_DATA_LOW_MASK);
 
 out_unlock:
 	mutex_unlock(&data->lock);
@@ -233,14 +249,9 @@ static int ap3216c_read_raw(struct iio_dev *indio_dev,
 	case IIO_CHAN_INFO_SCALE:
 		switch (chan->type) {
 		case IIO_LIGHT:
-			/* ALS量程默认 0~35271 lux, 16bit */
+			/* IIO_LIGHT scale 单位为 lux/LSB。 */
 			*val = 0;
-			*val2 = 35271; /* lux/count */
-			return IIO_VAL_INT_PLUS_MICRO;
-
-		case IIO_PROXIMITY:
-			*val = 0;
-			*val2 = 1;
+			*val2 = AP3216C_ALS_SCALE_MICRO;
 			return IIO_VAL_INT_PLUS_MICRO;
 
 		default:
@@ -262,8 +273,8 @@ static const struct iio_chan_spec ap3216c_channels[] = {
 	},
 	{
 		.type		= IIO_PROXIMITY,
-		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW) |
-				      BIT(IIO_CHAN_INFO_SCALE),
+		/* PS is a relative 10-bit count with no physical scale. */
+		.info_mask_separate = BIT(IIO_CHAN_INFO_RAW),
 		.datasheet_name	= "PS",
 	},
 };
@@ -286,20 +297,28 @@ static irqreturn_t ap3216c_irq_handler(int irq, void *dev_id)
 {
 	struct iio_dev *indio_dev = dev_id;
 	struct ap3216c_data *data = iio_priv(indio_dev);
-	int status;
+	int status, ret;
 
-	/* 读取中断状态寄存器 */
+	mutex_lock(&data->lock);
 	status = ap3216c_read_reg(data->client, AP3216C_INT_STATUS);
 	if (status < 0) {
 		dev_err(&data->client->dev, "读取中断状态失败: %d\n", status);
-		return IRQ_HANDLED;
+		goto out_unlock;
 	}
+	status &= AP3216C_INT_MASK;
 
 	dev_dbg(&data->client->dev, "AP3216C中断触发, 状态=0x%02x\n", status);
 
-	/* 清除中断标志（写1清除） */
-	ap3216c_write_reg(data->client, AP3216C_INT_STATUS, status | 0x01);
+	/* CLR_MNR=1时，向已置位的状态位写1清除；不要伪造ALS位。 */
+	if (status) {
+		ret = ap3216c_write_reg(data->client, AP3216C_INT_STATUS, status);
+		if (ret)
+			dev_err(&data->client->dev,
+				"清除中断状态失败: %d\n", ret);
+	}
 
+out_unlock:
+	mutex_unlock(&data->lock);
 	return IRQ_HANDLED;
 }
 
@@ -331,21 +350,23 @@ static int ap3216c_init_chip(struct ap3216c_data *data)
 	/* 等待复位完成 */
 	msleep(AP3216C_STARTUP_DELAY_MS);
 
-	/* 配置PS: 4个LED脉冲, 50%占空比 */
-	ret = ap3216c_write_reg(client, AP3216C_PS_LED, 0x33);
+	/* PS LED默认值：1个脉冲，100%最大驱动电流比例。 */
+	ret = ap3216c_write_reg(client, AP3216C_PS_LED,
+				AP3216C_PS_LED_DEFAULT);
 	if (ret) {
 		dev_err(&client->dev, "配置PS LED失败: %d\n", ret);
 		return ret;
 	}
 
-	/* 配置PS: 12bit, 满量程 */
-	ret = ap3216c_write_reg(client, AP3216C_PS_CFG, 0x03);
+	/* PS默认值：1T积分、x2增益、连续2次确认，输出10bit计数。 */
+	ret = ap3216c_write_reg(client, AP3216C_PS_CFG,
+				AP3216C_PS_CFG_DEFAULT);
 	if (ret) {
 		dev_err(&client->dev, "配置PS失败: %d\n", ret);
 		return ret;
 	}
 
-	/* 配置ALS: 16bit, 量程0~35271 lux */
+	/* 配置 ALS: 16bit，默认量程 0~20661 lux（0.35 lux/LSB） */
 	ret = ap3216c_write_reg(client, AP3216C_ALS_CFG, 0x00);
 	if (ret) {
 		dev_err(&client->dev, "配置ALS失败: %d\n", ret);
@@ -369,23 +390,25 @@ static int ap3216c_init_chip(struct ap3216c_data *data)
 /**
  * ap3216c_probe - I2C驱动探测函数
  * @client: I2C客户端
- * @id:     I2C设备ID
  *
  * 返回: 0成功，负数错误码
  */
-static int ap3216c_probe(struct i2c_client *client,
-			 const struct i2c_device_id *id)
+static int ap3216c_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
 	struct iio_dev *indio_dev;
 	struct ap3216c_data *data;
 	int ret;
 
+	if (!i2c_check_functionality(client->adapter,
+				     I2C_FUNC_SMBUS_BYTE_DATA))
+		return dev_err_probe(dev, -EOPNOTSUPP,
+				     "适配器不支持SMBus byte-data事务\n");
+
 	/* 检查设备存在（读取SYS_CONFIG寄存器验证） */
 	ret = i2c_smbus_read_byte_data(client, AP3216C_SYS_CONFIG);
 	if (ret < 0) {
-		dev_err(dev, "无法读取AP3216C设备: %d\n", ret);
-		return -ENODEV;
+		return dev_err_probe(dev, ret, "无法读取AP3216C设备\n");
 	}
 
 	/* 分配IIO设备 */
@@ -419,13 +442,22 @@ static int ap3216c_probe(struct i2c_client *client,
 	/* 可选：配置中断 */
 	if (client->irq > 0) {
 		data->irq = client->irq;
-		ret = devm_request_threaded_irq(dev, data->irq,
-						NULL, ap3216c_irq_handler,
-						IRQF_TRIGGER_FALLING |
-						IRQF_ONESHOT,
-						AP3216C_DRV_NAME, indio_dev);
+		/* 选择软件W1C，线程化handler才能显式清除已上报的状态位。 */
+		ret = ap3216c_write_reg(client, AP3216C_INT_CLEAR_MANNER,
+					AP3216C_INT_CLEAR_SW);
+		if (!ret)
+			ret = devm_request_threaded_irq(dev, data->irq,
+							NULL, ap3216c_irq_handler,
+							IRQF_TRIGGER_FALLING |
+							IRQF_ONESHOT,
+							AP3216C_DRV_NAME,
+							indio_dev);
 		if (ret) {
-			dev_err(dev, "中断申请失败: %d\n", ret);
+			dev_warn(dev, "中断模式不可用: %d\n", ret);
+			if (ap3216c_write_reg(client,
+					      AP3216C_INT_CLEAR_MANNER,
+					      AP3216C_INT_CLEAR_AUTO))
+				dev_warn(dev, "恢复自动中断清除模式失败\n");
 			/* 中断可选，失败不退出 */
 			data->irq = 0;
 		} else {
@@ -437,6 +469,8 @@ static int ap3216c_probe(struct i2c_client *client,
 	ret = devm_iio_device_register(dev, indio_dev);
 	if (ret) {
 		dev_err(dev, "IIO设备注册失败: %d\n", ret);
+		(void)ap3216c_write_reg(client, AP3216C_SYS_CONFIG,
+					AP3216C_MODE_POWERDOWN);
 		return ret;
 	}
 
@@ -451,17 +485,14 @@ static int ap3216c_probe(struct i2c_client *client,
  *
  * 设置芯片为关断模式以降低功耗。
  *
- * 返回: 0
  */
-static int ap3216c_remove(struct i2c_client *client)
+static void ap3216c_remove(struct i2c_client *client)
 {
 	/* 设置关断模式 */
 	i2c_smbus_write_byte_data(client, AP3216C_SYS_CONFIG,
 				  AP3216C_MODE_POWERDOWN);
 
 	dev_info(&client->dev, "AP3216C驱动卸载完成\n");
-
-	return 0;
 }
 
 #ifdef CONFIG_PM_SLEEP
@@ -517,7 +548,7 @@ static struct i2c_driver ap3216c_driver = {
 		.of_match_table	= ap3216c_of_match,
 		.pm		= &ap3216c_pm_ops,
 	},
-	.probe		= ap3216c_probe,
+	.probe_new	= ap3216c_probe,
 	.remove		= ap3216c_remove,
 	.id_table	= ap3216c_id,
 };

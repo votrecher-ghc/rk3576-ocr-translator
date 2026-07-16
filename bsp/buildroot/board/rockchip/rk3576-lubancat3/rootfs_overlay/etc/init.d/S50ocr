@@ -25,6 +25,7 @@ CONFIG_FILE="/etc/ocr/ocr_translator.json"
 LOG_FILE="/var/log/ocr_translator.log"
 # PID 文件
 PID_FILE="/var/run/ocr_translator.pid"
+MONITOR_PID_FILE="/var/run/ocr_translator-monitor.pid"
 
 # RT 调度优先级 (1-99, 越高越优先)
 RT_PRIORITY=80
@@ -32,6 +33,8 @@ RT_PRIORITY=80
 RESTART_DELAY=3
 # 最大重启次数 (连续失败超过此次数后停止, 需人工干预)
 MAX_RESTARTS=5
+# A process that remains healthy for this long starts a new restart window.
+STABLE_RUN_SECONDS=60
 
 # 进程名称 (用于 pgrep)
 APP_NAME="ocr_translator"
@@ -42,16 +45,58 @@ log() {
 }
 
 # 获取运行中的 PID
+is_app_pid() {
+    local pid="$1"
+    local proc_exe app_exe
+    case "${pid}" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    kill -0 "${pid}" 2>/dev/null || return 1
+    proc_exe=$(readlink -f "/proc/${pid}/exe" 2>/dev/null) || return 1
+    app_exe=$(readlink -f "${APP_BIN}" 2>/dev/null) || return 1
+    [ "${proc_exe}" = "${app_exe}" ]
+}
+
 get_pid() {
     if [ -f "${PID_FILE}" ]; then
         local pid
         pid=$(cat "${PID_FILE}" 2>/dev/null)
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        if is_app_pid "${pid}"; then
             echo "$pid"
             return 0
         fi
+        rm -f "${PID_FILE}"
     fi
     return 1
+}
+
+stop_monitor() {
+    local pid cmdline
+    if [ -f "${MONITOR_PID_FILE}" ]; then
+        read -r pid _ < "${MONITOR_PID_FILE}" || pid=""
+        case "${pid}" in
+            ''|*[!0-9]*) pid="" ;;
+        esac
+        if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+            cmdline=$(tr '\000' ' ' < "/proc/${pid}/cmdline" 2>/dev/null || true)
+            case "${cmdline}" in
+                *"${0##*/}"*) kill "${pid}" 2>/dev/null || true ;;
+                *) log "忽略不属于 OCR 监控器的陈旧 PID ${pid}" ;;
+            esac
+        fi
+        rm -f "${MONITOR_PID_FILE}"
+    fi
+}
+
+launch_app() {
+    if command -v chrt >/dev/null 2>&1; then
+        chrt -f "${RT_PRIORITY}" "${APP_BIN}" -c "${CONFIG_FILE}" \
+            >>"${LOG_FILE}" 2>&1 &
+    else
+        log "警告: chrt 不可用，使用普通调度策略启动"
+        "${APP_BIN}" -c "${CONFIG_FILE}" >>"${LOG_FILE}" 2>&1 &
+    fi
+    LAUNCHED_PID=$!
 }
 
 # ---------------------- 启动应用 ----------------------
@@ -82,18 +127,27 @@ start_app() {
 
     # 使用 chrt 设置 RT 调度策略 (SCHED_FIFO)
     # 后台运行, 输出重定向到日志文件
-    chrt -f "${RT_PRIORITY}" "${APP_BIN}" -c "${CONFIG_FILE}" \
-        >>"${LOG_FILE}" 2>&1 &
-    local new_pid=$!
+    launch_app
+    local new_pid="${LAUNCHED_PID}"
     echo "$new_pid" > "${PID_FILE}"
     log "已启动 (PID: ${new_pid})"
 
     # 启动监控进程 (处理异常退出重启)
+    local monitor_token="$(date +%s)-$$"
     (
+        cleanup_monitor_file() {
+            if grep -q " ${monitor_token}$" "${MONITOR_PID_FILE}" 2>/dev/null; then
+                rm -f "${MONITOR_PID_FILE}"
+            fi
+        }
+        trap cleanup_monitor_file EXIT
+        trap 'exit 0' INT TERM
         restart_count=0
-        while true; do
+        last_start=$(date +%s)
+        while [ -f "${PID_FILE}" ]; do
             sleep "${RESTART_DELAY}"
-            if ! kill -0 "$new_pid" 2>/dev/null; then
+            [ -f "${PID_FILE}" ] || break
+            if ! is_app_pid "$new_pid"; then
                 restart_count=$((restart_count + 1))
                 if [ "${restart_count}" -gt "${MAX_RESTARTS}" ]; then
                     log "错误: 连续重启超过 ${MAX_RESTARTS} 次, 停止重试"
@@ -103,14 +157,19 @@ start_app() {
                 fi
                 log "警告: 进程异常退出, ${RESTART_DELAY} 秒后重启 (第 ${restart_count}/${MAX_RESTARTS} 次)"
                 sleep "${RESTART_DELAY}"
-                chrt -f "${RT_PRIORITY}" "${APP_BIN}" -c "${CONFIG_FILE}" \
-                    >>"${LOG_FILE}" 2>&1 &
-                new_pid=$!
+                [ -f "${PID_FILE}" ] || break
+                launch_app
+                new_pid="${LAUNCHED_PID}"
+                last_start=$(date +%s)
                 echo "$new_pid" > "${PID_FILE}"
                 log "已重启 (PID: ${new_pid})"
+            elif [ $(( $(date +%s) - last_start )) -ge "${STABLE_RUN_SECONDS}" ]; then
+                restart_count=0
+                last_start=$(date +%s)
             fi
         done
     ) &
+    echo "$! ${monitor_token}" > "${MONITOR_PID_FILE}"
 }
 
 # ---------------------- 停止应用 ----------------------
@@ -118,6 +177,9 @@ stop_app() {
     local pid
     if pid=$(get_pid); then
         log "停止应用 (PID: ${pid})"
+        # 先撤销运行哨兵并停止监控，避免优雅退出被误判为崩溃后重启。
+        rm -f "${PID_FILE}"
+        stop_monitor
         # 先发送 SIGTERM (优雅退出)
         kill -TERM "$pid" 2>/dev/null
         # 等待最多 5 秒
@@ -131,14 +193,12 @@ stop_app() {
             log "强制终止 (SIGKILL)"
             kill -KILL "$pid" 2>/dev/null
         fi
-        rm -f "${PID_FILE}"
         log "已停止"
     else
         log "应用未在运行"
+        rm -f "${PID_FILE}"
+        stop_monitor
     fi
-
-    # 清理可能残留的监控子进程
-    pkill -f "ocr_translator.*-c" 2>/dev/null || true
 }
 
 # ---------------------- 查询状态 ----------------------
@@ -168,6 +228,7 @@ case "$1" in
         ;;
     status)
         status_app
+        exit $?
         ;;
     *)
         echo "用法: $0 {start|stop|restart|status}"

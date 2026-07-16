@@ -1,4 +1,5 @@
 {
+  "_note": "设计参考，不由运行时读取；生效配置统一写入 ocr_translator.json",
   "pipeline": {
     "name": "ocr_translator_main",
     "thread_model": "per_stage",

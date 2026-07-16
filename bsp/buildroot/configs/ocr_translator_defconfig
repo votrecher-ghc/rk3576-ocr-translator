@@ -6,8 +6,7 @@
 
 # ---------------------- 目标架构 ----------------------
 BR2_aarch64=y
-BR2_cortex_a76=y
-BR2_ARM_FPV_NEON_V8V2=y
+BR2_cortex_a72=y
 
 # ---------------------- 工具链: 外部 Linaro aarch64 ----------------------
 BR2_TOOLCHAIN_EXTERNAL=y
@@ -64,12 +63,12 @@ BR2_PACKAGE_FREETYPE=y
 # cJSON (JSON 配置解析)
 BR2_PACKAGE_CJSON=y
 
-# libjpeg-turbo (JPEG 归档)
-BR2_PACKAGE_LIBJPEG_TURBO=y
+# jpeg-turbo (JPEG 归档；Buildroot 的包符号不带 LIB 前缀)
+BR2_PACKAGE_JPEG=y
+BR2_PACKAGE_JPEG_TURBO=y
 BR2_PACKAGE_JPEG_SIMD_SUPPORT=y
 
-# pthread (POSIX 线程)
-BR2_PACKAGE_LINUX_PAM=y
+# pthread 由目标工具链的 libc 提供，不需要额外启用 PAM。
 
 # libpng (字体/图标资源)
 BR2_PACKAGE_LIBPNG=y
@@ -77,19 +76,24 @@ BR2_PACKAGE_LIBPNG=y
 # zlib (压缩)
 BR2_PACKAGE_ZLIB=y
 
-# IIO 传感器库
-BR2_PACKAGE_IIO_TOOLS=y
+# IIO 传感器调试工具 (iio_info/iio_readdev)
+BR2_PACKAGE_LIBIIO=y
+BR2_PACKAGE_LIBIIO_LOCAL_BACKEND=y
+BR2_PACKAGE_LIBIIO_TESTS=y
 
 # ---------------------- 包: 网络与调试 (最小化) ----------------------
-BR2_PACKAGE_DROPBEAR=y          # 轻量 SSH 服务 (调试用)
-BR2_PACKAGE_IPROUTE2=y          # 网络配置工具
+# Lightweight SSH server for board bring-up.
+BR2_PACKAGE_DROPBEAR=y
+# Network configuration tools.
+BR2_PACKAGE_IPROUTE2=y
 BR2_PACKAGE_ETHTOOL=y
 
 # ---------------------- 包: 系统工具 ----------------------
-BR2_PACKAGE_EUDEV=y             # 设备管理
+# Device manager.
+BR2_PACKAGE_EUDEV=y
 BR2_PACKAGE_UTIL_LINUX=y
 BR2_PACKAGE_UTIL_LINUX_MOUNT=y
-BR2_PACKAGE_UTIL_LINUX_FSTRIM=y
+BR2_PACKAGE_UTIL_LINUX_SCHEDUTILS=y
 
 # V4L2 工具 (调试摄像头用)
 BR2_PACKAGE_V4L2_TOOLS=y

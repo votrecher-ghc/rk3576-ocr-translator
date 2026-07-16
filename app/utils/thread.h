@@ -10,6 +10,8 @@
 #include <pthread.h>
 #include <semaphore.h>
 #include <stdint.h>
+#include <errno.h>
+#include <time.h>
 
 /* -------------------- 互斥锁 -------------------- */
 typedef pthread_mutex_t ocr_mutex_t;
@@ -70,7 +72,11 @@ static inline int ocr_sem_destroy(ocr_sem_t *s) {
     return sem_destroy(s) == 0 ? 0 : -1;
 }
 static inline int ocr_sem_wait(ocr_sem_t *s) {
-    return sem_wait(s) == 0 ? 0 : -1;
+    int ret;
+    do {
+        ret = sem_wait(s);
+    } while (ret != 0 && errno == EINTR);
+    return ret == 0 ? 0 : -1;
 }
 /** 超时等待（毫秒） */
 static inline int ocr_sem_wait_ms(ocr_sem_t *s, uint32_t ms) {
@@ -79,7 +85,10 @@ static inline int ocr_sem_wait_ms(ocr_sem_t *s, uint32_t ms) {
     ts.tv_sec  += ms / 1000;
     ts.tv_nsec += (long)(ms % 1000) * 1000000L;
     if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-    int ret = sem_timedwait(s, &ts);
+    int ret;
+    do {
+        ret = sem_timedwait(s, &ts);
+    } while (ret != 0 && errno == EINTR);
     return ret == 0 ? 0 : (errno == ETIMEDOUT ? 1 : -1);
 }
 static inline int ocr_sem_post(ocr_sem_t *s) {

@@ -2,6 +2,7 @@
 set(PIPELINE_SRC
     buffer.c
     buffer_pool.c
+    dma_heap.c
     zerocopy.c
     node.c
     pipeline.c

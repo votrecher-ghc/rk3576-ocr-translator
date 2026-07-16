@@ -12,6 +12,14 @@ TRACE_OUT="/tmp/dmabuf_trace.log"
 # 跟踪持续时间 (秒)
 DURATION="${DURATION:-10}"
 
+stop_trace() {
+    if [ -w "${TRACEFS}/tracing_on" ]; then
+        echo 0 > "${TRACEFS}/tracing_on" 2>/dev/null || true
+    fi
+}
+
+trap stop_trace EXIT
+
 # ---------------------- 辅助函数 ----------------------
 log() {
     echo -e "[DMATrace $(date '+%H:%M:%S')] $*"
@@ -81,18 +89,18 @@ collect_results() {
 
     # 输出统计摘要
     log "=== DMA-BUF 跟踪摘要 ==="
-    log "总事件数: $(grep -c '^' "${TRACE_OUT}" 2>/dev/null || echo 0)"
+    log "总事件数: $(grep -c '^' "${TRACE_OUT}" 2>/dev/null || true)"
 
     # 统计 dma_buf 操作
     log "dma_buf 操作统计:"
-    echo "  alloc: $(grep -c 'dma_buf_export\|dma_buf_dynamic_attach' "${TRACE_OUT}" 2>/dev/null || echo 0)"
-    echo "  map:   $(grep -c 'dma_buf_map_attachment' "${TRACE_OUT}" 2>/dev/null || echo 0)"
-    echo "  free:  $(grep -c 'dma_buf_release\|dma_buf_detach' "${TRACE_OUT}" 2>/dev/null || echo 0)"
+    echo "  alloc: $(grep -c 'dma_buf_export\|dma_buf_dynamic_attach' "${TRACE_OUT}" 2>/dev/null || true)"
+    echo "  map:   $(grep -c 'dma_buf_map_attachment' "${TRACE_OUT}" 2>/dev/null || true)"
+    echo "  free:  $(grep -c 'dma_buf_release\|dma_buf_detach' "${TRACE_OUT}" 2>/dev/null || true)"
 
     # 检查当前 dma_buf 缓冲区状态
     if [ -f "/sys/kernel/debug/dma_buf/bufinfo" ]; then
         log "当前 DMA-BUF 缓冲区状态:"
-        cat /sys/kernel/debug/dma_buf/bufinfo | head -30
+        head -30 /sys/kernel/debug/dma_buf/bufinfo
     fi
 
     log "完整跟踪日志: ${TRACE_OUT}"

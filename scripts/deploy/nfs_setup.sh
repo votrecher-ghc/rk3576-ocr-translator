@@ -8,7 +8,7 @@ set -e
 
 # ---------------------- 路径与网络变量 ----------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 # NFS 根目录 (挂载源)
 NFS_ROOT="${NFS_ROOT:-${PROJECT_ROOT}/output/rootfs/nfsroot}"
@@ -49,11 +49,19 @@ prepare_root() {
         log "NFS 根目录为空, 尝试从 rootfs.ext4 提取"
         log "提示: 需要 root 权限挂载 ext4 镜像"
         local MNT_TMP="/tmp/ocr_rootfs_mnt"
+        cleanup_rootfs_mount() {
+            if mountpoint -q "${MNT_TMP}" 2>/dev/null; then
+                sudo umount "${MNT_TMP}" || true
+            fi
+            rmdir "${MNT_TMP}" 2>/dev/null || true
+        }
+        trap cleanup_rootfs_mount EXIT INT TERM
         mkdir -p "${MNT_TMP}"
         sudo mount -o loop "${ROOTFS_IMG}" "${MNT_TMP}"
         sudo cp -a "${MNT_TMP}/." "${NFS_ROOT}/"
         sudo umount "${MNT_TMP}"
         rmdir "${MNT_TMP}"
+        trap - EXIT INT TERM
         log "rootfs 已提取到 NFS 根目录"
     fi
 }
@@ -104,9 +112,9 @@ print_board_cmd() {
     echo "  => setenv nfsroot ${NFS_SERVER_IP}:${NFS_ROOT}"
     echo "  => setenv bootargs root=/dev/nfs nfsroot=${NFS_SERVER_IP}:${NFS_ROOT} \\
          ip=<开发板IP>:${NFS_SERVER_IP}:<网关>:<掩码>::eth0 rw rootwait"
-    echo "  => tftpboot \\${kernel_addr_r} kernel/Image"
-    echo "  => tftpboot \\${fdt_addr_r} dtb/rk3576-lubancat3.dtb"
-    echo "  => booti \\${kernel_addr_r} - \\${fdt_addr_r}"
+    echo "  => tftpboot \${kernel_addr_r} kernel/Image"
+    echo "  => tftpboot \${fdt_addr_r} dtb/rk3576-lubancat3.dtb"
+    echo "  => booti \${kernel_addr_r} - \${fdt_addr_r}"
 }
 
 # ---------------------- 主流程 ----------------------

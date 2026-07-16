@@ -11,7 +11,7 @@
 
 /** 光传感器上下文 */
 typedef struct {
-    char sysfs_path[128];  /* IIO sysfs 路径（如 /sys/bus/iio/devices/iio:device0） */
+    char sysfs_path[128];  /* 动态发现的 IIO sysfs 路径（如 .../iio:deviceN） */
     int  cached_lux;       /* 缓存的光照值 */
 } ocr_light_sensor_t;
 

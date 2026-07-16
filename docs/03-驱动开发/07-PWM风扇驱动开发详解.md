@@ -3,6 +3,8 @@
 | 版本 | 日期       | 作者   | 变更说明 |
 | ---- | ---------- | ------ | -------- |
 | v1.0 | 2026-07-10 | 项目组 | 初始版本 |
+| v1.1 | 2026-07-13 | 项目组 | 对齐用户态独占 PWM、自动发现与安全恢复策略 |
+| v2.0 | 2026-07-16 | 项目组 | 补充交接日期和板端所有权验收要求 |
 
 ---
 
@@ -18,79 +20,50 @@
 
 ## 1. 硬件连接
 
-- PWM 风扇连接至 RK3576 PWM9 通道
-- PWM 频率：20kHz（period=50000ns）
+- 当前 overlay 示例使用 RK3576 PWM11；最终通道必须按原理图与 base DTS 核对
+- PWM 频率：25kHz（period=40000ns）
 - 支持转速反馈（TACH，可选）
 
 ## 2. DTS 配置
 
 ```dts
-&pwm9 {
+&pwm11 {
     status = "okay";
-    pinctrl-0 = <&pwm9m0_pins>;
-    pinctrl-names = "default";
-};
-
-fan: pwm-fan {
-    compatible = "pwm-fan";
-    pwms = <&pwm9 0 50000 0>;
-    cooling-levels = <0 30 60 80 100>;
-    #cooling-cells = <2>;
-    status = "okay";
+    ocr,fan-pwm;
 };
 ```
+
+`ocr,fan-pwm` 是无值发现标记，不是 consumer compatible。当前默认方案由
+`ocr_translator` 通过 sysfs 独占控制 PWM，所以同一通道不能同时创建内核
+`pwm-fan`/`ocr,pwm-fan` consumer。
 
 ## 3. 驱动实现
 
-> 内核内置 `pwm-fan` 驱动（`drivers/hwmon/pwm-fan.c`），无需自写。
+默认控制器位于 `app/sensors/fan_ctrl.c`。它在任何 PWM sysfs 枚举或写入前获取
+`/run/ocr-translator-fan.lock` 的非阻塞独占锁，按 DT 标记发现动态编号的
+`pwmchip`，并在退出时恢复外部状态或 disable/unexport 自己拥有的通道。auto 模式
+还会接管并清理上次崩溃遗留的专用 `pwm0` 导出。
 
-```c
-// 如需自定义，关键 PWM API:
-struct pwm_device *pwm = devm_pwm_get(dev, NULL);
-pwm_config(pwm, duty_ns, period_ns);  // 设置占空比
-pwm_enable(pwm);
-```
+仓库中的 `bsp/kernel/drivers/pwm_fan_ocr.c` 仅供改用内核 consumer 架构时选择；
+若启用它，必须同时停用应用的 sysfs 控制，二者不能共存。
 
 ## 4. 散热策略
 
-结合 thermal-zone 与 cooling-device 实现自动调速：
-
-```dts
-thermal-zones {
-    soc_thermal {
-        polling-delay-passive = <1000>;
-        trips {
-            fan_trip0: trip-point0 {
-                temperature = <45000>;
-                hysteresis = <2000>;
-                type = "active";
-            };
-            fan_trip1: trip-point1 {
-                temperature = <55000>;
-                hysteresis = <2000>;
-                type = "active";
-            };
-        };
-        cooling-maps {
-            map0 { trip = <&fan_trip0>; cooling-device = <&fan 1 4>; };
-            map1 { trip = <&fan_trip1>; cooling-device = <&fan 2 4>; };
-        };
-    };
-};
-```
+应用按 45/55/65/75°C 四个升档阈值调速，并使用 3°C 回差降档。温度设备缺失或
+读取失败时切到满速，避免传感器故障导致静默停转。板端必须验证 PWM 极性、风扇
+启转占空比、温度采样周期和掉电/异常退出行为。
 
 ## 5. 用户态控制
 
 ```bash
-# 导出 PWM
-echo 0 > /sys/class/pwm/pwmchip9/export
-# 设置周期（ns）
-echo 50000 > /sys/class/pwm/pwmchip9/pwm0/period
-# 设置占空比（ns），30% = 15000
-echo 15000 > /sys/class/pwm/pwmchip9/pwm0/duty_cycle
-# 使能
-echo 1 > /sys/class/pwm/pwmchip9/pwm0/enable
+# 先停止应用，再按 DT 标记定位动态编号的 pwmchip
+for chip in /sys/class/pwm/pwmchip*; do
+    [ -e "$chip/device/of_node/ocr,fan-pwm" ] && printf '%s\n' "$chip"
+done
 ```
+
+不要在应用运行时手工 export 或写占空比；板端调试应通过应用日志确认实际 chip、
+所有权模式和清理结果。
 
 > 详见 [06-硬件接口参考/外设接线/PWM风扇接口.md](../06-硬件接口参考/外设接线/PWM风扇接口.md)
 

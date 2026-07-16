@@ -23,7 +23,7 @@ OUTPUT_DIR = os.environ.get("MODEL_OUTPUT_DIR",
 # 模型源文件 (ONNX)
 ONNX_URL = os.environ.get(
     "DET_ONNX_URL",
-    "https://paddleocr.bj.bcebos.com/PP-OCRv4/chinese/ch_PP-OCRv4_det_infer.onnx"
+    ""
 )
 ONNX_PATH = os.environ.get("DET_ONNX_PATH",
                             os.path.join(SCRIPT_DIR, "ch_PP-OCRv4_det_infer.onnx"))
@@ -43,8 +43,10 @@ QUANT_IMG_DIR = os.environ.get(
 # 模型输入配置
 INPUT_WIDTH = 960
 INPUT_HEIGHT = 960
-MEAN_VALUES = [[0.485, 0.456, 0.406]]
-STD_VALUES = [[0.229, 0.224, 0.225]]
+# RKNN preprocess receives raw RGB bytes (0..255).  Keep these values in the
+# same pixel scale as the runtime's UINT8/NHWC input contract.
+MEAN_VALUES = [[123.675, 116.28, 103.53]]
+STD_VALUES = [[58.395, 57.12, 57.375]]
 
 
 def log(msg: str) -> None:
@@ -64,9 +66,12 @@ def download_onnx() -> None:
     if os.path.exists(ONNX_PATH):
         log(f"ONNX 模型已存在, 跳过下载: {ONNX_PATH}")
         return
+    if not ONNX_URL:
+        err("未找到检测 ONNX；请先按 PaddleOCR 官方 Paddle2ONNX 流程导出，"
+            "再设置 DET_ONNX_PATH（或显式设置 DET_ONNX_URL）")
 
     log(f"下载 ONNX 模型: {ONNX_URL}")
-    os.makedirs(os.path.dirname(ONNX_PATH), exist_ok=True)
+    os.makedirs(os.path.dirname(ONNX_PATH) or ".", exist_ok=True)
     try:
         urllib.request.urlretrieve(ONNX_URL, ONNX_PATH)
         log("下载完成")
@@ -93,7 +98,7 @@ def build_quant_dataset() -> None:
         f.write("\n".join(lines))
 
     if not lines:
-        log("警告: 未找到量化图片, 转换将无法正确量化, 请补充校准图片")
+        err(f"未找到量化图片；请将代表性 OCR 场景图放入 {QUANT_IMG_DIR}")
     else:
         log(f"共 {len(lines)} 张校准图片")
 
@@ -157,10 +162,16 @@ def verify_output() -> None:
 
 # ---------------------- 主流程 ----------------------
 def main() -> None:
+    global RKNN_TARGET
     parser = argparse.ArgumentParser(description="PaddleOCR det 模型转 RKNN (INT8)")
     parser.add_argument("--skip-download", action="store_true",
                         help="跳过 ONNX 下载步骤 (已手动准备)")
+    parser.add_argument("--target", default=os.environ.get(
+        "RKNN_TARGET", RKNN_TARGET), help="RKNN 目标平台")
+    parser.add_argument("--quantize", choices=("int8",), default="int8",
+                        help="兼容统一转换命令；检测模型仅支持 int8")
     args = parser.parse_args()
+    RKNN_TARGET = args.target
 
     log("=== 检测模型转换开始 ===")
     if not args.skip_download:

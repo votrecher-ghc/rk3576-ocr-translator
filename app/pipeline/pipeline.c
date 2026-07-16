@@ -1,7 +1,4 @@
-/**
- * @file pipeline.c
- * @brief 管线编排实现
- */
+/** @file pipeline.c @brief Pipeline topology lifecycle orchestration. */
 #include "pipeline.h"
 #include "log.h"
 
@@ -9,17 +6,30 @@
 
 int ocr_pipeline_init(ocr_pipeline_t *pl)
 {
-    if (!pl) return -1;
+    if (!pl) {
+        return -1;
+    }
     memset(pl, 0, sizeof(*pl));
     return 0;
 }
 
 int ocr_pipeline_add(ocr_pipeline_t *pl, ocr_pipeline_node_t *node)
 {
-    if (!pl || !node) return -1;
-    if (pl->node_count >= OCR_PIPELINE_MAX_NODES) {
-        LOG_E("管线节点数超过上限 %d", OCR_PIPELINE_MAX_NODES);
+    if (!pl || !node ||
+        !atomic_load_explicit(&node->initialized, memory_order_acquire)) {
+        return -1;
+    }
+    if (pl->started || pl->started_count != 0) {
         return -2;
+    }
+    for (int i = 0; i < pl->node_count; ++i) {
+        if (pl->nodes[i] == node) {
+            return 0;
+        }
+    }
+    if (pl->node_count >= OCR_PIPELINE_MAX_NODES) {
+        LOG_E("pipeline node limit (%d) exceeded", OCR_PIPELINE_MAX_NODES);
+        return -3;
     }
     pl->nodes[pl->node_count++] = node;
     return 0;
@@ -27,35 +37,91 @@ int ocr_pipeline_add(ocr_pipeline_t *pl, ocr_pipeline_node_t *node)
 
 int ocr_pipeline_start(ocr_pipeline_t *pl)
 {
-    if (!pl) return -1;
-    for (int i = 0; i < pl->node_count; i++) {
-        if (ocr_node_start(pl->nodes[i]) != 0) {
-            LOG_E("节点 %s 启动失败", pl->nodes[i]->name);
+    if (!pl) {
+        return -1;
+    }
+    if (pl->started) {
+        return 0;
+    }
+
+    pl->started_count = 0;
+    for (int i = 0; i < pl->node_count; ++i) {
+        if (!pl->nodes[i] || ocr_node_start(pl->nodes[i]) != 0) {
+            if (pl->nodes[i]) {
+                LOG_E("node %s failed to start", pl->nodes[i]->name);
+            } else {
+                LOG_E("pipeline contains a null node at index %d", i);
+            }
+            for (int j = pl->started_count - 1; j >= 0; --j) {
+                (void)ocr_node_stop(pl->nodes[j]);
+            }
+            pl->started_count = 0;
+            pl->started = 0;
             return -2;
         }
+        ++pl->started_count;
     }
+
     pl->started = 1;
     return 0;
 }
 
 int ocr_pipeline_stop(ocr_pipeline_t *pl)
 {
-    if (!pl) return -1;
-    /* 逆序停止 */
-    for (int i = pl->node_count - 1; i >= 0; i--) {
-        ocr_node_stop(pl->nodes[i]);
+    int failed = 0;
+
+    if (!pl) {
+        return -1;
     }
+    if (!pl->started && pl->started_count == 0) {
+        return 0;
+    }
+
+    for (int i = pl->started_count - 1; i >= 0; --i) {
+        if (pl->nodes[i] && ocr_node_stop(pl->nodes[i]) != 0) {
+            failed = 1;
+        }
+    }
+    if (failed) {
+        /* Keep the range so an external caller can retry any self-stop join. */
+        pl->started = 1;
+        return -2;
+    }
+
+    pl->started_count = 0;
+    pl->started = 0;
+    return 0;
+}
+
+int ocr_pipeline_destroy(ocr_pipeline_t *pl)
+{
+    if (!pl) return -1;
+    if (ocr_pipeline_stop(pl) != 0) return -2;
+    for (int i = pl->node_count - 1; i >= 0; --i) {
+        if (pl->nodes[i]) ocr_node_destroy(pl->nodes[i]);
+        pl->nodes[i] = NULL;
+    }
+    pl->node_count = 0;
+    pl->started_count = 0;
     pl->started = 0;
     return 0;
 }
 
 void ocr_pipeline_dump_stats(const ocr_pipeline_t *pl)
 {
-    if (!pl) return;
-    LOG_I("==== 管线统计 ====");
-    for (int i = 0; i < pl->node_count; i++) {
-        const ocr_pipeline_node_t *n = pl->nodes[i];
+    if (!pl) {
+        return;
+    }
+
+    LOG_I("pipeline statistics:");
+    for (int i = 0; i < pl->node_count; ++i) {
+        const ocr_pipeline_node_t *node = pl->nodes[i];
+        if (!node) {
+            continue;
+        }
         LOG_I("  [%s] processed=%d dropped=%d",
-              n->name, atomic_load(&n->processed), atomic_load(&n->dropped));
+              node->name,
+              atomic_load_explicit(&node->processed, memory_order_relaxed),
+              atomic_load_explicit(&node->dropped, memory_order_relaxed));
     }
 }

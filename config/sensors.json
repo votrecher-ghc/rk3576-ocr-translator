@@ -1,43 +1,50 @@
 {
+  "_note": "设计参考，不由运行时读取；生效配置统一写入 ocr_translator.json",
   "sensors": {
     "ambient_light": {
       "enabled": true,
-      "iio_device": "/sys/bus/iio/devices/iio:device0",
-      "channel": "in_illuminance_raw",
-      "scale": 0.01,
+      "iio_device": "auto",
+      "iio_name": "ap3216c",
+      "preferred_channel": "in_illuminance_input",
+      "raw_channel": "in_illuminance_raw",
+      "scale_channel": "in_illuminance_scale",
       "poll_interval_ms": 1000,
       "thresholds": {
-        "backlight_low": 50,
-        "backlight_mid": 200,
-        "backlight_high": 500
+        "backlight_10pct_below_lux": 10,
+        "backlight_25pct_below_lux": 50,
+        "backlight_50pct_below_lux": 200,
+        "backlight_75pct_below_lux": 1000
       },
       "backlight_map": {
-        "low": 60,
-        "mid": 150,
-        "high": 230
+        "very_low_pct": 10,
+        "low_pct": 25,
+        "mid_pct": 50,
+        "high_pct": 75,
+        "full_pct": 100
       }
     },
     "temperature": {
       "enabled": true,
-      "iio_device": "/sys/bus/iio/devices/iio:device1",
-      "channel": "in_temp_raw",
-      "scale": 0.001,
+      "iio_device": "auto",
+      "iio_name": "adt7410",
+      "preferred_channel": "in_temp_input",
+      "raw_channel": "in_temp_raw",
+      "scale_channel": "in_temp_scale",
+      "offset_channel": "in_temp_offset",
       "poll_interval_ms": 1000,
       "thresholds": {
-        "fan_off": 45,
-        "fan_low": 55,
-        "fan_mid": 65,
-        "fan_high": 75,
-        "thermal_throttle": 85,
-        "shutdown": 95
+        "up_mdeg": [45000, 55000, 65000, 75000],
+        "down_mdeg": [42000, 52000, 62000, 72000]
       },
       "fan_duty_map": {
         "off": 0,
-        "low": 40,
-        "mid": 70,
-        "high": 100
+        "low_pct": 25,
+        "mid_pct": 50,
+        "high_pct": 75,
+        "full_pct": 100
       },
-      "fan_period_ns": 100000
+      "fan_period_ns": 40000,
+      "sensor_failure_level_pct": 100
     },
     "humidity": {
       "enabled": false,
@@ -51,7 +58,7 @@
     "enable_watchdog": true,
     "watchdog_device": "/dev/watchdog",
     "watchdog_timeout_s": 10,
-    "enable_thermal_shutdown": true,
+    "enable_thermal_shutdown": false,
     "enable_overcurrent_detect": false
   }
 }

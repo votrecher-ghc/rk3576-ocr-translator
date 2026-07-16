@@ -10,25 +10,21 @@
 #include <signal.h>
 #include <unistd.h>
 
-/* 全局指针（信号处理函数需访问，不能传参） */
-static ocr_system_manager_t *s_sm = NULL;
+static volatile sig_atomic_t s_exit_signal = 0;
 
 /* 信号处理函数 */
 static void signal_handler(int sig)
 {
-    if (!s_sm) return;
-    LOG_I("收到信号 %d，请求优雅退出", sig);
-    ocr_system_manager_request_exit(s_sm, 0);
+    s_exit_signal = sig;
 }
 
 /* 看门狗线程入口 */
 static void *watchdog_thread(void *arg)
 {
     ocr_system_manager_t *sm = (ocr_system_manager_t *)arg;
-    /* timeout 通过 user_ctx 传递不便，这里用固定 5 秒超时 */
-    const uint32_t timeout_ms = 5000;
-    uint64_t last_feed = 0;
-    int last_count = 0;
+    const uint32_t timeout_ms = sm->watchdog_timeout_ms;
+    uint64_t last_feed = timestamp_ms();
+    int last_count = atomic_load(&sm->feed_count);
 
     LOG_I("看门狗线程启动 (timeout=%ums)", timeout_ms);
 
@@ -39,9 +35,8 @@ static void *watchdog_thread(void *arg)
             last_count = cur_count;
         } else {
             /* 检查超时 */
-            if (timestamp_diff_ms(last_feed, timestamp_ms()) > timeout_ms && last_feed != 0) {
+            if (timestamp_diff_ms(last_feed, timestamp_ms()) > timeout_ms) {
                 LOG_E("看门狗超时！强制退出");
-                /* TODO: 可在此触发核心转储或重启 */
                 ocr_system_manager_request_exit(sm, -1);
                 break;
             }
@@ -62,7 +57,8 @@ int ocr_system_manager_init(ocr_system_manager_t *sm)
     atomic_init(&sm->feed_count, 0);
     atomic_init(&sm->watchdog_running, 0);
     sm->start_time = timestamp_ms();
-    s_sm = sm;
+    sm->watchdog_timeout_ms = 5000;
+    s_exit_signal = 0;
     return 0;
 }
 
@@ -91,11 +87,12 @@ int ocr_system_manager_install_signals(ocr_system_manager_t *sm)
 
 int ocr_system_manager_start_watchdog(ocr_system_manager_t *sm, uint32_t timeout_ms)
 {
-    if (!sm) return -1;
-    (void)timeout_ms; /* 当前使用固定值，见线程函数 */
-    atomic_store(&sm->watchdog_running, 1);
+    if (!sm || timeout_ms == 0) return -1;
+    if (atomic_exchange(&sm->watchdog_running, 1)) return 0;
+    sm->watchdog_timeout_ms = timeout_ms;
     ocr_system_manager_feed(sm); /* 初始喂狗 */
     if (ocr_thread_create(&sm->watchdog_tid, watchdog_thread, sm) != 0) {
+        atomic_store(&sm->watchdog_running, 0);
         LOG_E("看门狗线程创建失败");
         return -2;
     }
@@ -118,6 +115,12 @@ void ocr_system_manager_request_exit(ocr_system_manager_t *sm, int code)
 int ocr_system_manager_should_exit(ocr_system_manager_t *sm)
 {
     if (!sm) return 1;
+    if (s_exit_signal != 0) {
+        int sig = s_exit_signal;
+        s_exit_signal = 0;
+        LOG_I("收到信号 %d，请求优雅退出", sig);
+        ocr_system_manager_request_exit(sm, 0);
+    }
     return atomic_load(&sm->state) >= SYS_STATE_SHUTTING_DOWN ? 1 : 0;
 }
 
@@ -133,8 +136,9 @@ int ocr_system_manager_wait_exit(ocr_system_manager_t *sm)
 void ocr_system_manager_stop_watchdog(ocr_system_manager_t *sm)
 {
     if (!sm) return;
-    atomic_store(&sm->watchdog_running, 0);
-    ocr_thread_join(sm->watchdog_tid, NULL);
+    if (atomic_exchange(&sm->watchdog_running, 0)) {
+        ocr_thread_join(sm->watchdog_tid, NULL);
+    }
 }
 
 void ocr_system_manager_destroy(ocr_system_manager_t *sm)
@@ -142,5 +146,4 @@ void ocr_system_manager_destroy(ocr_system_manager_t *sm)
     if (!sm) return;
     ocr_system_manager_stop_watchdog(sm);
     atomic_store(&sm->state, SYS_STATE_STOPPED);
-    s_sm = NULL;
 }

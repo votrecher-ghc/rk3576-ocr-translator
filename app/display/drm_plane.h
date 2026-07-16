@@ -23,6 +23,20 @@ typedef struct {
     ocr_plane_type_t type;/* Plane 类型 */
     uint32_t fb_id;       /* 当前绑定的 framebuffer ID */
     int      in_use;      /* 是否已使用 */
+    uint32_t possible_crtcs; /* 可绑定 CRTC 位图 */
+    int      supports_nv12;  /* 是否支持 DRM_FORMAT_NV12 */
+    int      supports_argb;  /* 是否支持 DRM_FORMAT_ARGB8888 */
+    uint32_t zpos_prop_id;   /* zpos 属性 ID，0=不支持 */
+    uint64_t zpos_min;
+    uint64_t zpos_max;
+    uint64_t zpos;
+    uint32_t blend_prop_id;  /* pixel blend mode 属性 ID */
+    uint64_t premult_value;  /* Pre-multiplied 枚举值 */
+    uint32_t original_crtc_id;
+    uint32_t original_fb_id;
+    uint64_t original_zpos;
+    uint64_t original_blend_value;
+    uint64_t blend_value;
 } ocr_drm_plane_t;
 
 /** Plane 管理器 */
@@ -51,6 +65,18 @@ int ocr_drm_planes_init(ocr_drm_planes_t *planes, ocr_drm_device_t *dev);
 int ocr_drm_plane_set_fb(ocr_drm_planes_t *planes, ocr_drm_plane_t *plane,
                          uint32_t fb_id, uint32_t x, uint32_t y,
                          uint32_t w, uint32_t h);
+
+/**
+ * @brief 设置 Plane framebuffer，并分别指定源、目标矩形
+ *
+ * src 使用像素单位，内部转换为 DRM 16.16 固定点；dst 为屏幕坐标。
+ */
+int ocr_drm_plane_set_fb_ex(ocr_drm_planes_t *planes, ocr_drm_plane_t *plane,
+                            uint32_t fb_id,
+                            uint32_t src_x, uint32_t src_y,
+                            uint32_t src_w, uint32_t src_h,
+                            uint32_t dst_x, uint32_t dst_y,
+                            uint32_t dst_w, uint32_t dst_h);
 
 /**
  * @brief 禁用 Plane

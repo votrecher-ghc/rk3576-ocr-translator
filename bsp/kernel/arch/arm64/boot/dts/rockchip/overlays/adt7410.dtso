@@ -29,18 +29,12 @@
 			adt7410: adt7410@48 {
 				compatible = "ocr,adt7410";
 				reg = <0x48>;
+				#io-channel-cells = <1>;
 
 				/* 供电配置 */
 				vdd-supply = <&vcc_3v3_s3>;
 
 				status = "okay";
-			};
-
-			/* 定义IIO通道，供PWM风扇驱动引用 */
-			adt7410_iio: adt7410-iio {
-				/* IIO通道名称，pwm_fan通过此名称获取温度 */
-				io-channels = <&adt7410 0>;
-				io-channel-names = "temp_adc";
 			};
 		};
 	};
