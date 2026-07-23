@@ -282,8 +282,7 @@ out_unlock:
 	return ret;
 }
 
-static int adt7410_probe(struct i2c_client *client,
-			 const struct i2c_device_id *id)
+static int adt7410_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
 	struct adt7410_data *data;
@@ -328,9 +327,8 @@ static int adt7410_probe(struct i2c_client *client,
 	return 0;
 }
 
-static int adt7410_remove(struct i2c_client *client)
+static void adt7410_remove(struct i2c_client *client)
 {
-	return 0;
 }
 
 static int __maybe_unused adt7410_suspend(struct device *dev)
@@ -386,7 +384,7 @@ static struct i2c_driver adt7410_driver = {
 		.of_match_table = adt7410_of_match,
 		.pm = &adt7410_pm_ops,
 	},
-	.probe = adt7410_probe,
+	.probe_new = adt7410_probe,
 	.remove = adt7410_remove,
 	.id_table = adt7410_i2c_ids,
 };
