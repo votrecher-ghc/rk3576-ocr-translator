@@ -108,7 +108,7 @@
 - 光照 raw 回退必须成对读取对应 scale，不再把 ADC count 当作 lux。
 - IIO 设备按 sysfs `name` 唯一匹配；重复名称会明确失败。
 - input 设备按 `EV_KEY + KEY_CAMERA` capability 唯一匹配，不依赖 `event0`。
-- 风扇 auto 模式通过 DT 的 `ocr,fan-pwm` 标记定位动态编号的 `pwmchip`。
+- 默认使用 `kernel` 模式，由 `bsp/external-modules/pwm-fan/` 独占 PWM 并在内核中闭环温控；需要应用层直接控制时仍可配置 `auto`，两种模式不可同时启用。
 - 风扇控制在任何 PWM 枚举或写入前获取 `/run/ocr-translator-fan.lock` 非阻塞独占锁。
 - auto 模式会接管并清理崩溃遗留的专用 `pwm0`；显式路径模式则保存和恢复外部 PWM 状态。
 - 温度缺失或读取失败时切到满速故障安全档。
@@ -414,7 +414,7 @@ docs/07-测试/07-测试报告模板.md
 | `app/ai/` | RKNN、OCR 与翻译 |
 | `app/stab/` | IIO IMU、姿态融合与补偿 |
 | `app/sensors/` | IIO 发现、亮度、温度和 PWM 风扇 |
-| `bsp/kernel/drivers/` | 自研 Linux 6.1 驱动 |
+| `bsp/external-modules/<外设>/` | 按外设拆分的自研 Linux 6.1 模块与 Overlay |
 | `bsp/kernel/arch/arm64/boot/dts/rockchip/overlays/` | 待板级核对的 overlay |
 | `bsp/buildroot/` | Buildroot external tree 与 rootfs overlay |
 | `scripts/build/` | 构建入口 |
