@@ -95,7 +95,7 @@ int main(void)
 
     CHECK(strcmp(cfg.backlight_path,
                  "/sys/class/backlight/panel-backlight/brightness") == 0);
-    CHECK(strcmp(cfg.pwm_path, "auto") == 0);
+    CHECK(strcmp(cfg.pwm_path, "kernel") == 0);
 
     config_free(&cfg);
     check_rejects_long_device_path("sensors", "ambient_light_device");
