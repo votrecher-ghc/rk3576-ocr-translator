@@ -349,8 +349,7 @@ out_unlock:
 	return ret;
 }
 
-static int ap3216c_probe(struct i2c_client *client,
-			 const struct i2c_device_id *id)
+static int ap3216c_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
 	struct ap3216c_data *data;
@@ -391,7 +390,7 @@ static int ap3216c_probe(struct i2c_client *client,
 	return 0;
 }
 
-static int ap3216c_remove(struct i2c_client *client)
+static void ap3216c_remove(struct i2c_client *client)
 {
 	struct iio_dev *indio_dev = i2c_get_clientdata(client);
 	struct ap3216c_data *data = iio_priv(indio_dev);
@@ -401,7 +400,8 @@ static int ap3216c_remove(struct i2c_client *client)
 	ret = ap3216c_set_mode_locked(data, AP3216C_MODE_POWER_DOWN);
 	mutex_unlock(&data->lock);
 
-	return ret;
+	if (ret)
+		dev_warn(&client->dev, "failed to power down sensor: %d\n", ret);
 }
 
 static int __maybe_unused ap3216c_suspend(struct device *dev)
@@ -457,7 +457,7 @@ static struct i2c_driver ap3216c_driver = {
 		.of_match_table = ap3216c_of_match,
 		.pm = &ap3216c_pm_ops,
 	},
-	.probe = ap3216c_probe,
+	.probe_new = ap3216c_probe,
 	.remove = ap3216c_remove,
 	.id_table = ap3216c_i2c_ids,
 };
