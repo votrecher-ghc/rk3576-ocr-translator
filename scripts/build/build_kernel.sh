@@ -128,33 +128,33 @@ build_modules() {
 }
 
 build_ocr_modules() {
-    local module_dir="${PROJECT_ROOT}/bsp/kernel/drivers"
+    local module_root="${PROJECT_ROOT}/bsp/external-modules"
+    local module_dir
     local module
-    local ocr_configs=(
-        CONFIG_OCR_GPIO_KEYS=m
-        CONFIG_IIO_AP3216C=m
-        CONFIG_IIO_ICM42688_SPI=m
-        CONFIG_IIO_ADT7410=m
-        CONFIG_PWM_FAN_OCR=m
+    local module_dirs=(
+        gpio-capture-key
+        ap3216c
+        icm42688
+        adt7410
+        pwm-fan
     )
     local expected_modules=(
-        gpio_keys_ocr
+        gpio_capture_key
         iio_ap3216c
         iio_icm42688_spi
         iio_adt7410
         pwm_fan_ocr
     )
-    log "编译项目自研 OCR 内核模块"
-    make -C "${SRC_DIR}" M="${module_dir}" ARCH="${ARCH}" \
-        CROSS_COMPILE="${CROSS_COMPILE}" \
-        "${ocr_configs[@]}" -j"${JOBS}" modules
-
-    # External-module Kbuild variables are command-line-only; pass the exact
-    # same set to modules_install so it cannot see an empty obj-$(CONFIG_*) set.
-    make -C "${SRC_DIR}" M="${module_dir}" ARCH="${ARCH}" \
-        CROSS_COMPILE="${CROSS_COMPILE}" \
-        "${ocr_configs[@]}" \
-        INSTALL_MOD_PATH="${OUT_DIR}/modules" modules_install
+    log "按外设目录编译项目自研 OCR 内核模块"
+    for module_dir in "${module_dirs[@]}"; do
+        module_dir="${module_root}/${module_dir}"
+        [ -d "${module_dir}" ] || err "未找到 OCR 模块目录: ${module_dir}"
+        make -C "${SRC_DIR}" M="${module_dir}" ARCH="${ARCH}" \
+            CROSS_COMPILE="${CROSS_COMPILE}" -j"${JOBS}" modules
+        make -C "${SRC_DIR}" M="${module_dir}" ARCH="${ARCH}" \
+            CROSS_COMPILE="${CROSS_COMPILE}" \
+            INSTALL_MOD_PATH="${OUT_DIR}/modules" modules_install
+    done
 
     for module in "${expected_modules[@]}"; do
         find "${OUT_DIR}/modules/lib/modules" -type f \
@@ -167,7 +167,8 @@ build_ocr_modules() {
 }
 
 build_ocr_overlays() {
-    local overlay_src="${PROJECT_ROOT}/bsp/kernel/arch/arm64/boot/dts/rockchip/overlays"
+    local module_root="${PROJECT_ROOT}/bsp/external-modules"
+    local camera_overlay="${PROJECT_ROOT}/bsp/kernel/arch/arm64/boot/dts/rockchip/overlays/imx415-csi2.dtso"
     local overlay_out="${OUT_DIR}/dtbo"
     local dtc_bin="${SRC_DIR}/scripts/dtc/dtc"
     [ -x "${dtc_bin}" ] || dtc_bin="$(command -v dtc || true)"
@@ -175,18 +176,25 @@ build_ocr_overlays() {
     command -v "${CROSS_COMPILE}gcc" >/dev/null 2>&1 || \
         err "未找到 ${CROSS_COMPILE}gcc"
     mkdir -p "${overlay_out}"
-    local source preprocessed output
-    for source in "${overlay_src}"/*.dtso; do
-        [ -f "${source}" ] || err "未找到 OCR overlay 源文件: ${overlay_src}"
-        if [ "$(basename "${source}")" = "imx415-csi2.dtso" ] &&
+    local source preprocessed output overlay_name
+    local overlay_sources=("${module_root}"/*/*-overlay.dts)
+    [ -f "${overlay_sources[0]}" ] || err "未找到外设 overlay 源文件: ${module_root}"
+    if [ -f "${camera_overlay}" ]; then
+        overlay_sources+=("${camera_overlay}")
+    fi
+    for source in "${overlay_sources[@]}"; do
+        if [ "${source}" = "${camera_overlay}" ] &&
            [ "${BUILD_UNVERIFIED_CAMERA_OVERLAY:-0}" != "1" ]; then
             log "  跳过未按 vendor media graph 核对的 imx415-csi2.dtso"
             continue
         fi
         preprocessed="$(mktemp)"
-        # Prefix project overlays so a generic basename can never overwrite a
-        # vendor DTBO collected into the same staging directory.
-        output="${overlay_out}/ocr-$(basename "${source}" .dtso).dtbo"
+        if [ "${source}" = "${camera_overlay}" ]; then
+            overlay_name="imx415-csi2"
+        else
+            overlay_name="$(basename "$(dirname "${source}")")"
+        fi
+        output="${overlay_out}/ocr-${overlay_name}.dtbo"
         if ! "${CROSS_COMPILE}gcc" -E -nostdinc -undef -D__DTS__ \
             -I "${SRC_DIR}/include" \
             -I "${SRC_DIR}/arch/${ARCH}/boot/dts" \
