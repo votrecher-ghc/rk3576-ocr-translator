@@ -1,0 +1,38 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "embedfire,rk3576-lubancat-3", "rockchip,rk3576";
+};
+
+/* Replace the stock generic pwm-fan node that owns the same PWM channel. */
+&fan {
+	status = "disabled";
+};
+
+&pwm2_8ch_6 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&pwm2m0_ch6>;
+};
+
+&{/} {
+	ocr_pwm_fan: ocr-pwm-fan {
+		compatible = "ocr,pwm-fan-controller";
+
+		/* Same board fan PWM channel and period used by the stock DTS. */
+		pwms = <&pwm2_8ch_6 0 5000 0>;
+
+		/* ADT7410 channel 0 is the IIO temperature channel. */
+		io-channels = <&adt7410 0>;
+		io-channel-names = "temp";
+
+		/* Four automatic fan levels: off, low, medium and full. */
+		ocr,temp-levels-millicelsius = <40000 55000 65000>;
+		ocr,pwm-duty-levels = <0 110 180 255>;
+		ocr,hysteresis-millicelsius = <3000>;
+		ocr,poll-interval-ms = <2000>;
+
+		status = "okay";
+	};
+};
