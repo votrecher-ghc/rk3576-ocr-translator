@@ -150,7 +150,7 @@ static void config_defaults(ocr_config_t *cfg)
     snprintf(cfg->key_device, sizeof(cfg->key_device), "%s", "auto");
     snprintf(cfg->backlight_path, sizeof(cfg->backlight_path), "%s",
              "/sys/class/backlight/panel-backlight/brightness");
-    snprintf(cfg->pwm_path, sizeof(cfg->pwm_path), "%s", "auto");
+    snprintf(cfg->pwm_path, sizeof(cfg->pwm_path), "%s", "kernel");
 }
 
 int config_load(ocr_config_t *cfg, const char *path)
