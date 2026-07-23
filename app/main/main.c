@@ -102,6 +102,7 @@ static ocr_brightness_t g_brightness;
 static ocr_temp_sensor_t g_temp;
 static ocr_fan_ctrl_t g_fan;
 static int g_light_ready, g_brightness_ready, g_temp_ready, g_fan_ready;
+static int g_fan_kernel_managed;
 static ocr_key_event_t_ctx g_key;
 static ocr_capture_session_t g_session;
 static ocr_archiver_t g_archiver;
@@ -295,13 +296,23 @@ static int init_hardware(const ocr_config_t *config)
     g_temp_ready = resolve_iio_path(config->temp_iio_device, "adt7410", 0,
                                     temp_path, sizeof(temp_path)) == 0 &&
                    ocr_temp_sensor_init(&g_temp, temp_path) == 0;
-    if (!g_temp_ready) LOG_W("温度传感器不可用；用户态风扇调速已禁用");
-    g_fan_ready = ocr_fan_ctrl_init(&g_fan, config->pwm_path) == 0;
-    if (!g_fan_ready) {
+    if (!g_temp_ready) LOG_W("温度传感器不可用");
+    g_fan_kernel_managed = strcasecmp(config->pwm_path, "kernel") == 0;
+    if (g_fan_kernel_managed) {
+        LOG_I("PWM 风扇由 ocr-pwm-fan 内核模块管理");
+        g_fan_ready = 0;
+    } else {
+        g_fan_ready = ocr_fan_ctrl_init(&g_fan, config->pwm_path) == 0;
+    }
+    if (!g_fan_ready && !g_fan_kernel_managed) {
         LOG_W("PWM 风扇不可用");
     } else if (!g_temp_ready) {
-        LOG_W("温度反馈不可用；风扇进入全速故障安全模式");
-        (void)ocr_fan_ctrl_set_level(&g_fan, FAN_MAX_LEVEL);
+        if (g_fan_kernel_managed) {
+            LOG_W("用户态温度反馈不可用；内核风扇驱动保持独立故障安全控制");
+        } else {
+            LOG_W("温度反馈不可用；风扇进入全速故障安全模式");
+            (void)ocr_fan_ctrl_set_level(&g_fan, FAN_MAX_LEVEL);
+        }
     }
     return 0;
 }

@@ -1,0 +1,44 @@
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/pinctrl/rockchip.h>
+
+/ {
+	compatible = "embedfire,rk3576-lubancat-3", "rockchip,rk3576";
+};
+
+/*
+ * LubanCat 3 40-pin header wiring:
+ *
+ *   Pin 7  GPIO4_A6  -> normally-open capture button
+ *   Pin 9  GND       -> other side of the button
+ *
+ * The pin is pulled high internally. Pressing the button connects it to
+ * ground, therefore the GPIO is described as active-low.
+ */
+&pinctrl {
+	ocr_capture_key_pins {
+		ocr_capture_key_pin: ocr-capture-key-pin {
+			rockchip,pins = <4 RK_PA6 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+	};
+};
+
+&{/} {
+	ocr_capture_key: ocr-capture-key {
+		compatible = "ocr,gpio-capture-key";
+
+		pinctrl-names = "default";
+		pinctrl-0 = <&ocr_capture_key_pin>;
+
+		key-gpios = <&gpio4 RK_PA6 GPIO_ACTIVE_LOW>;
+		linux,code = <KEY_CAMERA>;
+		label = "OCR capture key";
+		debounce-interval-ms = <20>;
+
+		wakeup-source;
+		status = "okay";
+	};
+};

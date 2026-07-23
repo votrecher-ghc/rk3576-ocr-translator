@@ -1,0 +1,53 @@
+/dts-v1/;
+/plugin/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/pinctrl/rockchip.h>
+
+/ {
+	compatible = "embedfire,rk3576-lubancat-3", "rockchip,rk3576";
+};
+
+/*
+ * LubanCat 3 40-pin header wiring used by this overlay:
+ *
+ *   Pin 17  3V3            -> ICM42688 VCC/VCCIO
+ *   Pin 20  GND            -> ICM42688 GND
+ *   Pin 19  GPIO1_B5       -> SPI1_MOSI_M0
+ *   Pin 21  GPIO1_B6       -> SPI1_MISO_M0
+ *   Pin 23  GPIO1_B4       -> SPI1_CLK_M0
+ *   Pin 24  GPIO1_B7       -> SPI1_CSN0_M0
+ *   Pin 22  GPIO4_A0       -> ICM42688 INT1
+ */
+
+&pinctrl {
+	icm42688 {
+		icm42688_int1: icm42688-int1 {
+			rockchip,pins = <4 RK_PA0 RK_FUNC_GPIO &pcfg_pull_down>;
+		};
+	};
+};
+
+/* The stock board DTS contains this placeholder child on SPI1. */
+&mcp2515 {
+	status = "disabled";
+};
+
+&spi1 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&spi1m0_csn0 &spi1m0_pins &icm42688_int1>;
+	num-cs = <1>;
+
+	icm42688@0 {
+		compatible = "invensense,icm42688";
+		reg = <0>;
+		spi-max-frequency = <24000000>;
+
+		interrupt-parent = <&gpio4>;
+		interrupts = <RK_PA0 IRQ_TYPE_EDGE_RISING>;
+
+		status = "okay";
+	};
+};

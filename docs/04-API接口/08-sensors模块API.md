@@ -92,6 +92,10 @@ int ocr_fan_ctrl_destroy(ocr_fan_ctrl_t *ctrl);
 - `/sys/class/pwm/pwmchipX/pwmY`；
 - 对应的 `duty_cycle` 路径。
 
+主配置的 `pwm_fan_path` 还可设为 `"kernel"`（默认），此时主程序不调用以上
+用户态 PWM API，而由 `ocr-pwm-fan` 模块独占 PWM、消费 ADT7410 IIO 温度并完成
+闭环温控。`kernel` 与 `auto`/显式 sysfs 路径是互斥的所有权模式。
+
 auto 模式在枚举前持有 `/run/ocr-translator-fan.lock`。若专用 `pwm0` 已导出且没有
 活跃 owner，则按崩溃遗留接管，退出时 disable/unexport。显式路径下的既有 PWM
 会保存并恢复原始 enable/period/duty。

@@ -67,7 +67,7 @@ typedef struct {
     char     temp_iio_device[128];  /* 温度 IIO sysfs 路径或 auto */
     char     key_device[64];        /* KEY_CAMERA input 节点或 auto */
     char     backlight_path[128]; /* 背光 sysfs 路径 */
-    char     pwm_path[128];       /* PWM 风扇 sysfs 路径或 auto */
+    char     pwm_path[128];       /* "kernel"、"auto" 或 PWM sysfs 路径 */
 } ocr_config_t;
 
 /**

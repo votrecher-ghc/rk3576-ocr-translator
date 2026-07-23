@@ -1,0 +1,19 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "embedfire,rk3576-lubancat-3", "rockchip,rk3576";
+};
+
+&i2c7 {
+	status = "okay";
+	clock-frequency = <400000>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c7m1_xfer>;
+
+	ap3216c@1e {
+		compatible = "liteon,ap3216c";
+		reg = <0x1e>;
+		status = "okay";
+	};
+};
