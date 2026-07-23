@@ -43,7 +43,7 @@
     "ambient_light_device": "auto",
     "temperature_device": "auto",
     "backlight_path": "/sys/class/backlight/panel-backlight/brightness",
-    "pwm_fan_path": "auto"
+    "pwm_fan_path": "kernel"
   },
   "input": {
     "key_device": "auto"
