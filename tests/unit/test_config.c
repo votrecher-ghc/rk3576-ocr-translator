@@ -54,8 +54,8 @@ int main(void)
     CHECK(cfg.capture_buffer_count == 4);
 
     CHECK(strcmp(cfg.drm_device, "/dev/dri/card0") == 0);
-    CHECK(cfg.display_width == 1920);
-    CHECK(cfg.display_height == 1080);
+    CHECK(cfg.display_width == 1280);
+    CHECK(cfg.display_height == 720);
 
     CHECK(strcmp(cfg.det_model,
                  "/usr/share/ocr/models/ppocrv4_det_int8.rknn") == 0);
@@ -87,7 +87,7 @@ int main(void)
     CHECK(cfg.imu_sample_hz == 1000);
     CHECK(cfg.stab_alpha > 0.099f && cfg.stab_alpha < 0.101f);
     CHECK(cfg.madgwick_beta > 0.099f && cfg.madgwick_beta < 0.101f);
-    CHECK(cfg.stab_crop_ratio > 0.899f && cfg.stab_crop_ratio < 0.901f);
+    CHECK(cfg.stab_crop_ratio > 0.832f && cfg.stab_crop_ratio < 0.835f);
 
     CHECK(strcmp(cfg.light_iio_device, "auto") == 0);
     CHECK(strcmp(cfg.temp_iio_device, "auto") == 0);
