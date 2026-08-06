@@ -14,8 +14,8 @@
   },
   "display": {
     "device": "/dev/dri/card0",
-    "display_width": 1920,
-    "display_height": 1080
+    "display_width": 1280,
+    "display_height": 720
   },
   "ai": {
     "det_model": "/usr/share/ocr/models/ppocrv4_det_int8.rknn",
@@ -35,7 +35,7 @@
   "stab": {
     "imu_device": "auto",
     "sample_rate": 1000,
-    "crop_ratio": 0.9,
+    "crop_ratio": 0.833333,
     "filter_beta": 0.1,
     "madgwick_beta": 0.1
   },
