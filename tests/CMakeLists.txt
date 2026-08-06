@@ -24,6 +24,22 @@ ocr_add_unit_test(test_buffer unit/test_buffer.c ocr_pipeline pthread)
 ocr_add_unit_test(test_config unit/test_config.c ocr_utils)
 ocr_add_unit_test(test_pipeline integration/test_pipeline.c ocr_pipeline pthread)
 
+add_executable(test_pose_history
+    unit/test_pose_history.c
+    "${CMAKE_CURRENT_LIST_DIR}/../app/stab/pose_history.c"
+)
+target_include_directories(test_pose_history PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/../app/stab"
+    "${CMAKE_CURRENT_LIST_DIR}/../app/comm"
+    "${CMAKE_CURRENT_LIST_DIR}/../app/utils"
+)
+target_link_libraries(test_pose_history PRIVATE m pthread)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(test_pose_history PRIVATE -UNDEBUG)
+endif()
+add_test(NAME test_pose_history COMMAND test_pose_history)
+set_tests_properties(test_pose_history PROPERTIES TIMEOUT 30)
+
 add_executable(test_ocr_postproc
     unit/test_ocr_postproc.c
     "${CMAKE_CURRENT_LIST_DIR}/../app/ai/ocr_postproc.c"
