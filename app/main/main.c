@@ -19,6 +19,7 @@
 #include "translator.h"
 #include "imu_reader.h"
 #include "attitude_fusion.h"
+#include "pose_history.h"
 #include "motion_compensate.h"
 #include "iio_discovery.h"
 #include "light_sensor.h"
@@ -33,6 +34,7 @@
 
 #include <errno.h>
 #include <getopt.h>
+#include <limits.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -42,6 +44,12 @@
 #include <unistd.h>
 
 #define LIVE_OVERLAY_MAX_ITEMS 32
+
+/*
+ * V4L2 和 IIO 都使用 CLOCK_MONOTONIC 时间戳。若实测发现图像相对陀螺仪
+ * 固定超前或滞后，可先通过互相关标定，再修改这个偏移量。
+ */
+#define EIS_CAMERA_IMU_OFFSET_NS INT64_C(0)
 
 typedef struct {
     int logging;
@@ -94,9 +102,11 @@ static ocr_rec_t g_rec;
 static ocr_translator_t g_translator;
 static ocr_imu_reader_t g_imu;
 static ocr_attitude_t g_attitude;
+static ocr_pose_history_t g_pose_history;
 static ocr_motion_comp_t g_motion;
 static ocr_rga_stabilizer_t g_stabilizer;
 static int64_t g_last_imu_timestamp;
+static int g_gyro_bias_logged;
 static ocr_light_sensor_t g_light;
 static ocr_brightness_t g_brightness;
 static ocr_temp_sensor_t g_temp;
@@ -282,9 +292,12 @@ static int init_hardware(const ocr_config_t *config)
     if (g_init.imu) {
         (void)ocr_attitude_init(&g_attitude, (float)config->imu_sample_hz,
                                 config->madgwick_beta);
+        ocr_pose_history_init(&g_pose_history);
         (void)ocr_motion_comp_init(&g_motion, 60.0f, 45.0f, config->stab_alpha);
         g_motion.max_scale = 1.0f / config->stab_crop_ratio;
         (void)ocr_rga_stab_init(&g_stabilizer, config->stab_alpha);
+        LOG_I("EIS uses frame timestamp interpolation, camera/IMU offset=%lld ns",
+              (long long)EIS_CAMERA_IMU_OFFSET_NS);
     }
 
     g_light_ready = resolve_iio_path(config->light_iio_device, "ap3216c", 0,
@@ -394,23 +407,83 @@ static int capture_frame(ocr_buffer_t *buffer, void *user_data)
     return ocr_node_push_input((ocr_pipeline_node_t *)user_data, buffer);
 }
 
-static int update_stabilizer_from_imu(uint32_t width, uint32_t height)
+static int frame_pose_timestamp(uint64_t frame_timestamp,
+                                int64_t *pose_timestamp)
 {
-    if (!g_init.imu) return 0;
+    if (!pose_timestamp || frame_timestamp == 0 ||
+        frame_timestamp > (uint64_t)INT64_MAX) {
+        return -1;
+    }
+    if (EIS_CAMERA_IMU_OFFSET_NS > 0 &&
+        (int64_t)frame_timestamp > INT64_MAX - EIS_CAMERA_IMU_OFFSET_NS) {
+        return -1;
+    }
+    if (EIS_CAMERA_IMU_OFFSET_NS < 0 &&
+        (int64_t)frame_timestamp < INT64_MIN - EIS_CAMERA_IMU_OFFSET_NS) {
+        return -1;
+    }
+    *pose_timestamp = (int64_t)frame_timestamp + EIS_CAMERA_IMU_OFFSET_NS;
+    return 0;
+}
+
+static int update_stabilizer_from_imu(uint32_t width, uint32_t height,
+                                      uint64_t frame_timestamp)
+{
     imu_sample_t sample;
-    int updated = 0;
+    quaternion_t frame_q;
+    ocr_attitude_t frame_attitude;
+    int64_t target_timestamp;
+
+    if (!g_init.imu) return 0;
+
     while (ocr_imu_reader_get(&g_imu, &sample) == 0) {
         float dt = 0.0f;
-        if (g_last_imu_timestamp > 0 && sample.timestamp > g_last_imu_timestamp)
+
+        if (g_last_imu_timestamp > 0 &&
+            sample.timestamp <= g_last_imu_timestamp) {
+            LOG_W("IMU timestamp moved backwards; resetting EIS history");
+            g_last_imu_timestamp = 0;
+            ocr_pose_history_reset(&g_pose_history);
+            ocr_attitude_reset(&g_attitude);
+            ocr_motion_comp_reset(&g_motion);
+        }
+        if (g_last_imu_timestamp > 0)
             dt = (float)((sample.timestamp - g_last_imu_timestamp) / 1.0e9);
         g_last_imu_timestamp = sample.timestamp;
-        if (ocr_attitude_update(&g_attitude, sample.accel_si, sample.gyro_si, dt) == 0)
-            updated = 1;
+
+        if (ocr_attitude_update(&g_attitude, sample.accel_si,
+                                sample.gyro_si, dt) == 0) {
+            int push_result = ocr_pose_history_push(&g_pose_history,
+                                                     sample.timestamp,
+                                                     &g_attitude.q);
+            if (push_result == -2) {
+                ocr_pose_history_reset(&g_pose_history);
+                (void)ocr_pose_history_push(&g_pose_history,
+                                            sample.timestamp,
+                                            &g_attitude.q);
+            }
+        }
     }
-    if (updated) {
+
+    if (!g_gyro_bias_logged && ocr_attitude_bias_ready(&g_attitude)) {
+        LOG_I("IMU gyro bias calibration complete");
+        g_gyro_bias_logged = 1;
+    }
+
+    if (frame_pose_timestamp(frame_timestamp, &target_timestamp) != 0 ||
+        ocr_pose_history_sample(&g_pose_history, target_timestamp,
+                                &frame_q) != 0) {
+        return 0;
+    }
+
+    /* 只替换查询时刻的四元数，保留融合器配置和校准状态。 */
+    frame_attitude = g_attitude;
+    frame_attitude.q = frame_q;
+
+    {
         ocr_stab_params_t params;
-        if (ocr_motion_comp_update(&g_motion, &g_attitude, width, height,
-                                   &params) == 0)
+        if (ocr_motion_comp_update(&g_motion, &frame_attitude,
+                                   width, height, &params) == 0)
             return ocr_rga_stab_update(&g_stabilizer, &params);
     }
     return 0;
@@ -426,7 +499,8 @@ static int rga_process(ocr_pipeline_node_t *node, ocr_buffer_t *input)
     output->frame_id = input->frame_id;
 
     int ret;
-    (void)update_stabilizer_from_imu(input->width, input->height);
+    (void)update_stabilizer_from_imu(input->width, input->height,
+                                     input->timestamp);
     if (g_init.imu)
         ret = ocr_rga_stab_apply(&g_stabilizer, input, output);
     else
