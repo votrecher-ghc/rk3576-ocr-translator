@@ -2,6 +2,7 @@
 set(STAB_SRC
     imu_reader.c
     attitude_fusion.c
+    pose_history.c
     motion_compensate.c
 )
 add_library(ocr_stab STATIC ${STAB_SRC})
