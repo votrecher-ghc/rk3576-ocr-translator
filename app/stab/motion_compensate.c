@@ -59,9 +59,9 @@ int ocr_motion_comp_update(ocr_motion_comp_t *mc, const ocr_attitude_t *att,
                            ocr_stab_params_t *params)
 {
     euler_t current;
-    float error_pitch;
-    float error_roll;
-    float error_yaw;
+    float error_x;
+    float error_y;
+    float error_z;
     float fx;
     float fy;
     float crop_w;
@@ -112,21 +112,21 @@ int ocr_motion_comp_update(ocr_motion_comp_t *mc, const ocr_attitude_t *att,
     mc->smooth_euler.yaw = follow_angle(mc->smooth_euler.yaw,
                                         current.yaw, mc->alpha);
 
-    error_roll = wrap_degrees(mc->smooth_euler.roll - current.roll);
-    error_pitch = wrap_degrees(mc->smooth_euler.pitch - current.pitch);
-    error_yaw = wrap_degrees(mc->smooth_euler.yaw - current.yaw);
+    /*
+     * 安装矩阵输出采用摄像头坐标：X 向右、Y 向下、Z 向前。
+     * roll/pitch/yaw 分别代表绕 X/Y/Z 轴的旋转。
+     */
+    error_x = wrap_degrees(mc->smooth_euler.roll - current.roll);
+    error_y = wrap_degrees(mc->smooth_euler.pitch - current.pitch);
+    error_z = wrap_degrees(mc->smooth_euler.yaw - current.yaw);
 
     fx = focal_length_pixels(img_w, mc->hfov_deg);
     fy = focal_length_pixels(img_h, mc->vfov_deg);
     if (fx <= 0.0f || fy <= 0.0f) return -3;
 
-    /*
-     * 陀螺仪给出旋转角，RGA 最终执行窗口平移。使用透视投影关系
-     * pixel = focal_length * tan(angle)，小角度时等价于 f * angle。
-     * 符号与 rga_stabilizer.c 中 crop = center - offset 配套。
-     */
-    dx = -fx * tanf(error_yaw * OCR_MOTION_DEG_TO_RAD);
-    dy = -fy * tanf(error_pitch * OCR_MOTION_DEG_TO_RAD);
+    /* 绕 Y 轴改变水平视线，绕 X 轴改变垂直视线。 */
+    dx = -fx * tanf(error_y * OCR_MOTION_DEG_TO_RAD);
+    dy = -fy * tanf(error_x * OCR_MOTION_DEG_TO_RAD);
     if (!isfinite(dx) || !isfinite(dy)) return -3;
 
     crop_w = (float)img_w / mc->max_scale;
@@ -139,8 +139,8 @@ int ocr_motion_comp_update(ocr_motion_comp_t *mc, const ocr_attitude_t *att,
     params->dx = ocr_clamp_f(dx, -max_dx, max_dx);
     params->dy = ocr_clamp_f(dy, -max_dy, max_dy);
 
-    /* RK3576 RGA 只支持直角旋转；roll 留给后续 GPU Homography。 */
-    (void)error_roll;
+    /* 绕 Z 轴会造成图像旋转，RK3576 RGA 无法补偿任意小角度。 */
+    (void)error_z;
     params->angle = 0.0f;
     return 0;
 }
