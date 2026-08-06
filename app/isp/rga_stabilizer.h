@@ -2,10 +2,10 @@
 #define OCR_ISP_RGA_STABILIZER_H
 /**
  * @file rga_stabilizer.h
- * @brief 防抖补偿：根据 IMU 运动参数执行 RGA 变换
+ * @brief 根据最终补偿参数执行固定窗口 RGA 裁剪与缩放
  *
- * 接收 motion_compensate 计算的平移/旋转量，
- * 通过 RGA 对图像执行反向变换以稳定画面。
+ * 姿态轨迹平滑由 motion_compensate 完成。本模块不再重复低通，避免
+ * 两级滤波造成补偿延迟。
  */
 
 #include "buffer.h"
@@ -13,36 +13,34 @@
 
 /** 防抖补偿参数（来自 motion_compensate） */
 typedef struct {
-    float dx;        /* 水平平移（像素） */
-    float dy;        /* 垂直平移（像素） */
-    float angle;     /* 旋转角度（度） */
-    float scale;     /* 缩放系数（>1 放大以覆盖黑边） */
+    float dx;        /* 水平裁剪偏移（原始图像像素） */
+    float dy;        /* 垂直裁剪偏移（原始图像像素） */
+    float angle;     /* 保留字段；RGA 不执行任意角度旋转 */
+    float scale;     /* 固定裁剪放大系数，例如 1.2 对应 1600x900 */
 } ocr_stab_params_t;
 
 /** 防抖器上下文 */
 typedef struct {
-    ocr_stab_params_t cur;    /* 当前补偿参数 */
-    ocr_stab_params_t target; /* 目标参数（低通滤波后） */
-    float alpha;              /* 滤波系数 */
+    ocr_stab_params_t cur;    /* 当前实际使用的补偿参数 */
+    ocr_stab_params_t target; /* motion_compensate 输出的最终参数 */
+    float alpha;              /* 兼容字段；滤波已移到姿态层 */
     int   enabled;            /* 是否启用防抖 */
 } ocr_rga_stabilizer_t;
 
 /**
  * @brief 初始化防抖器
  * @param[in] stab   防抖器
- * @param[in] alpha  低通滤波系数 [0,1]
+ * @param[in] alpha  兼容参数，当前不在 RGA 层重复滤波
  */
 int ocr_rga_stab_init(ocr_rga_stabilizer_t *stab, float alpha);
 
 /**
- * @brief 更新目标补偿参数（来自 IMU 运动估计）
+ * @brief 更新最终补偿参数
  */
 int ocr_rga_stab_update(ocr_rga_stabilizer_t *stab, const ocr_stab_params_t *params);
 
 /**
- * @brief 对输入帧执行防抖补偿（RGA 平移+旋转）
- * @param[in]     stab 防抖器
- * @param[in,out] buf  输入/输出缓冲（原地变换或输出到新缓冲）
+ * @brief 从输入帧裁剪固定窗口并缩放到目标缓冲
  * @return 0=成功，负数=错误
  */
 int ocr_rga_stab_apply(ocr_rga_stabilizer_t *stab, ocr_buffer_t *src, ocr_buffer_t *dst);
