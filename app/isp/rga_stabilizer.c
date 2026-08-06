@@ -53,8 +53,10 @@ static void fit_crop_to_destination(const ocr_buffer_t *src,
 
     if (width > (float)src->width) width = (float)src->width;
     if (height > (float)src->height) height = (float)src->height;
-    *crop_w = (uint32_t)floorf(width);
-    *crop_h = (uint32_t)floorf(height);
+
+    /* 先四舍五入再做色度对齐，避免 1600.0 的浮点误差变成 1598。 */
+    *crop_w = (uint32_t)lroundf(width);
+    *crop_h = (uint32_t)lroundf(height);
 }
 
 int ocr_rga_stab_apply(ocr_rga_stabilizer_t *stab,
