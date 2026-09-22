@@ -9,6 +9,7 @@
 #include <drm_fourcc.h>
 #include <drm_mode.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
