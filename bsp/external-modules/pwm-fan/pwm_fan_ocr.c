@@ -257,7 +257,10 @@ static const struct hwmon_ops ocr_pwm_fan_hwmon_ops = {
 	.write = ocr_pwm_fan_hwmon_write,
 };
 
-static const struct hwmon_channel_info * const ocr_pwm_fan_hwmon_info[] = {
+/* 6.1 的 hwmon_chip_info.info 是 const struct hwmon_channel_info **,
+ * 内层 const 要到更高版本内核才引入, 这里不能加。
+ */
+static const struct hwmon_channel_info *ocr_pwm_fan_hwmon_info[] = {
 	HWMON_CHANNEL_INFO(temp, HWMON_T_INPUT),
 	HWMON_CHANNEL_INFO(pwm, HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
 	NULL,

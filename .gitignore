@@ -7,7 +7,10 @@
 __pycache__/
 Module.symvers
 modules.order
+modules.builtin*
 .tmp_versions/
+# out-of-tree 内核模块构建生成的命令记录文件
+.*.cmd
 
 # Build directories
 build/

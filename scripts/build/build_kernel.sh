@@ -2,7 +2,7 @@
 # =====================================================================
 # Linux 内核编译脚本 (野火 LubanCat3 / RK3576)
 # 功能: 克隆野火内核源码 (lbc-develop-6.1 分支), 配置并交叉编译
-# 输出: Image, rk3576-lubancat3.dtb, *.dtbo, modules.tar.gz
+# 输出: Image, rk3576-lubancat-3.dtb, *.dtbo, modules.tar.gz
 # =====================================================================
 set -euo pipefail
 
@@ -11,8 +11,10 @@ set -euo pipefail
 KERNEL_REPO="https://gitee.com/lubancat/linux.git"
 # 使用的分支 (6.1 LTS)
 KERNEL_BRANCH="lbc-develop-6.1"
-# 默认 defconfig
-KERNEL_DEFCONFIG="lubancat3_rk3576_defconfig"
+# 默认 defconfig (野火 SDK 实际提供的名字)
+KERNEL_DEFCONFIG="${KERNEL_DEFCONFIG:-lubancat_linux_rk3576_defconfig}"
+# 目标板 DTB 名字 (野火 SDK 实际提供的名字)
+KERNEL_DTB_NAME="${KERNEL_DTB_NAME:-rk3576-lubancat-3.dtb}"
 
 # 构建目录
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -53,6 +55,13 @@ prepare_source() {
 
 # ---------------------- 步骤2: 配置 defconfig ----------------------
 configure() {
+    # vendor SDK 的 .config / defconfig 常带本地定制, 默认不覆盖。
+    # 需要强制从 defconfig 重新生成时显式设置 KERNEL_FORCE_DEFCONFIG=1。
+    if [ -s "${SRC_DIR}/.config" ] && [ "${KERNEL_FORCE_DEFCONFIG:-0}" != "1" ]; then
+        log "沿用现有内核配置: ${SRC_DIR}/.config"
+        log "  (需要重新生成请设置 KERNEL_FORCE_DEFCONFIG=1)"
+        return
+    fi
     log "配置 defconfig: ${KERNEL_DEFCONFIG}"
     make ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" "${KERNEL_DEFCONFIG}"
 }
@@ -89,7 +98,7 @@ build_dtb() {
 
     # 拷贝目标 DTB
     mkdir -p "${OUT_DIR}"
-    DTB_FILE="arch/${ARCH}/boot/dts/rockchip/rk3576-lubancat3.dtb"
+    DTB_FILE="arch/${ARCH}/boot/dts/rockchip/${KERNEL_DTB_NAME}"
     if [ -f "${DTB_FILE}" ]; then
         cp -v "${DTB_FILE}" "${OUT_DIR}/"
     else

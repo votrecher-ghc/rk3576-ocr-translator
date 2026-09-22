@@ -157,7 +157,11 @@ static int ocr_capture_key_probe(struct platform_device *pdev)
 
 	input_set_capability(input, EV_KEY, key->code);
 
-	ret = devm_input_register_device(dev, input);
+	/* devm_input_allocate_device() 已把 input 标记为 devres 托管,
+	 * input_register_device() 会自动登记反注册动作。6.1 内核没有
+	 * devm_input_register_device()。
+	 */
+	ret = input_register_device(input);
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "failed to register input device\n");
