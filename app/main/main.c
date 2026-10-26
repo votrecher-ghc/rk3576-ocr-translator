@@ -693,7 +693,11 @@ static int init_pipeline(int live_ocr)
     if (ocr_node_link(&g_rga_node, &g_display_node) != 0) return -8;
 
     if (live_ocr) {
+        /* OCR 一帧要几百毫秒，而输出池只有 4 块 B。若按队列排队，排着的每一帧都占住
+         * 一块 B，池被 OCR 占满后 RGA 取不到缓冲，屏幕也跟着停顿。仅空闲接收让 OCR
+         * 只处理识别完当时的最新一帧，最多占一块 B，显示保持摄像头帧率。 */
         if (ocr_node_init(&g_ocr_node, "ocr", ocr_process, NULL) != 0 ||
+            ocr_node_set_idle_only(&g_ocr_node, 1) != 0 ||
             ocr_pipeline_add(&g_pipeline, &g_ocr_node) != 0 ||
             ocr_node_link(&g_rga_node, &g_ocr_node) != 0) return -9;
     }

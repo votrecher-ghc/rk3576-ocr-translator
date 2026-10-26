@@ -6,6 +6,7 @@
  * @brief Pipeline worker node, bounded input queue, and fan-out handling.
  *
  * 每个节点拥有工作线程和有界输入队列；入队传递一个引用，队列满时丢弃并释放最旧帧。
+ * 慢分支可设为仅空闲接收：处理中或已有待处理帧时直接拒收，节点最多只占一个缓冲。
  * 回调借用输入；返回 0 转发原图，正数表示已自行输出，负数表示丢帧。分发每个下游都独立持有引用。
  */
 
@@ -42,6 +43,7 @@ typedef struct ocr_pipeline_node {
 
     struct ocr_pipeline_node *downstream[OCR_NODE_MAX_DOWNSTREAM]; /* 启动前建立拓扑。 */
     int                 downstream_count; /**< downstream 的有效项数，最多 4 个；启动前固定。 */
+    int                 idle_only; /**< 1=只在工作线程空闲且队列为空时接收新帧；启动前固定。 */
 
     ocr_mutex_t         lifecycle_lock; /**< 串行化 link/start/stop，区别于保护输入队列的 in_lock。 */
     ocr_thread_t        thread; /**< 本节点工作线程句柄；thread_started=1 时仍需 join 回收。 */
@@ -50,6 +52,8 @@ typedef struct ocr_pipeline_node {
     atomic_int          running; /**< 工作循环的继续运行请求；置 0 后还要唤醒条件变量并 join。 */
     atomic_int          processed; /**< 回调返回非负的输入帧累计数，不等于成功显示或识别的帧数。 */
     atomic_int          dropped; /**< 队列淘汰、回调失败等丢帧统计；由工作线程和入队线程原子累加。 */
+    atomic_int          busy; /**< 工作线程已取出一帧且尚未释放；在 in_lock 内与出队一起置位。 */
+    atomic_int          skipped; /**< idle_only 节点因忙拒收的帧数；属于正常跳帧，不计入 dropped。 */
 } ocr_pipeline_node_t;
 
 /**
@@ -72,8 +76,17 @@ int ocr_node_link(ocr_pipeline_node_t *node,
                   ocr_pipeline_node_t *downstream);
 
 /**
+ * @brief 在启动前把节点设为仅空闲接收，用于处理慢、只需要最新画面的分支
+ * @return 0=成功，-1=无效节点，-2=节点已启动
+ * @note 开启后节点同一时刻最多持有一帧（待处理或处理中），忙时 push_input 返回 -2。
+ *       与它共用缓冲池的其他分支因此不会被这个慢节点占满缓冲而停顿。
+ */
+int ocr_node_set_idle_only(ocr_pipeline_node_t *node, int enable);
+
+/**
  * @brief 把调用者已有的一份引用转移到输入队列，不复制像素，也不额外 ref。
- * @return 0 接管成功；负数 未接管，调用者仍需释放或另作处理。
+ * @return 0 接管成功；-1 参数无效或节点不可用；-2 仅空闲接收的节点正忙。
+ *         非 0 时都未接管，调用者仍需释放或另作处理。
  * @note 队列满时淘汰最旧项并接收本项，旧引用在解锁后释放，不以队列满阻塞生产者。
  *       队列项和正在执行的回调各自持有引用；工作线程从队列取出时转移而不新增引用。
  */

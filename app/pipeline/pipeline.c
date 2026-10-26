@@ -131,9 +131,10 @@ void ocr_pipeline_dump_stats(const ocr_pipeline_t *pl)
         if (!node) {
             continue;
         }
-        LOG_I("  [%s] processed=%d dropped=%d",
+        LOG_I("  [%s] processed=%d dropped=%d skipped=%d",
               node->name,
               atomic_load_explicit(&node->processed, memory_order_relaxed),
-              atomic_load_explicit(&node->dropped, memory_order_relaxed));
+              atomic_load_explicit(&node->dropped, memory_order_relaxed),
+              atomic_load_explicit(&node->skipped, memory_order_relaxed));
     }
 }

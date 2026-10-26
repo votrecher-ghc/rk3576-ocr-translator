@@ -21,6 +21,7 @@ ocr_add_unit_test(test_ringbuffer unit/test_ringbuffer.c ocr_comm)
 ocr_add_unit_test(test_msgbus unit/test_msgbus.c ocr_comm)
 ocr_add_unit_test(test_event_loop unit/test_event_loop.c ocr_comm)
 ocr_add_unit_test(test_buffer unit/test_buffer.c ocr_pipeline pthread)
+ocr_add_unit_test(test_node unit/test_node.c ocr_pipeline pthread)
 ocr_add_unit_test(test_config unit/test_config.c ocr_utils)
 ocr_add_unit_test(test_pipeline integration/test_pipeline.c ocr_pipeline pthread)
 

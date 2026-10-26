@@ -93,6 +93,8 @@ int ocr_node_init(ocr_pipeline_node_t *node, const char *name,
     atomic_init(&node->running, 0);
     atomic_init(&node->processed, 0);
     atomic_init(&node->dropped, 0);
+    atomic_init(&node->busy, 0);
+    atomic_init(&node->skipped, 0);
     atomic_init(&node->initialized, 1);
     return 0;
 }
@@ -133,6 +135,26 @@ out:
     return ret;
 }
 
+int ocr_node_set_idle_only(ocr_pipeline_node_t *node, int enable)
+{
+    int ret = 0;
+
+    if (!node ||
+        !atomic_load_explicit(&node->initialized, memory_order_acquire)) {
+        return -1;
+    }
+
+    /* 与拓扑一样在启动前固定：线程创建建立先后关系，运行时入队方无需再加锁读取。 */
+    ocr_mutex_lock(&node->lifecycle_lock);
+    if (atomic_load_explicit(&node->thread_started, memory_order_acquire)) {
+        ret = -2;
+    } else {
+        node->idle_only = enable ? 1 : 0;
+    }
+    ocr_mutex_unlock(&node->lifecycle_lock);
+    return ret;
+}
+
 /** @brief 成功入队时接管调用者的一个引用；失败不接管，满队列淘汰最旧帧。 */
 int ocr_node_push_input(ocr_pipeline_node_t *node, ocr_buffer_t *buf)
 {
@@ -148,6 +170,17 @@ int ocr_node_push_input(ocr_pipeline_node_t *node, ocr_buffer_t *buf)
     if (!atomic_load_explicit(&node->initialized, memory_order_acquire)) {
         ocr_mutex_unlock(&node->in_lock);
         return -1;
+    }
+
+    /* 仅空闲接收：处理中或已有一帧待处理时直接拒收，既不排队也不淘汰。
+     * 慢分支因此最多占住一个缓冲，不会把与其他分支共用的输出池耗尽。
+     * busy 与出队在同一把锁内更新，不存在“帧已取走、尚未置忙”的空档。 */
+    if (node->idle_only &&
+        (atomic_load_explicit(&node->busy, memory_order_acquire) ||
+         atomic_load_explicit(&node->in_count, memory_order_relaxed) > 0)) {
+        ocr_mutex_unlock(&node->in_lock);
+        atomic_fetch_add_explicit(&node->skipped, 1, memory_order_relaxed);
+        return -2;
     }
 
     /* 实时图像优先保留新帧：队列满时丢最旧项而非阻塞采集/RGA。
@@ -229,6 +262,8 @@ void *ocr_node_thread_entry(void *arg)
         node->in_queue[node->in_head] = NULL;
         node->in_head = (node->in_head + 1) % OCR_NODE_QUEUE_DEPTH;
         atomic_fetch_sub_explicit(&node->in_count, 1, memory_order_release);
+        /* 与出队同一临界区置忙，idle_only 入队判断看到的队列和忙状态总是一致。 */
+        atomic_store_explicit(&node->busy, buf != NULL, memory_order_relaxed);
         ocr_mutex_unlock(&node->in_lock);
 
         if (!buf) {
@@ -260,6 +295,8 @@ void *ocr_node_thread_entry(void *arg)
          * RGA 输入若同时是 latest_frame，这次释放不会归零；等最新帧缓存也换掉
          * 后才触发 QBUF。输出图则等显示与 OCR 的引用都释放后才归还输出池。 */
         (void)ocr_buffer_unref(buf);
+        /* 先归还输入再清忙：idle_only 节点接收下一帧时，上一帧已不再占用缓冲。 */
+        atomic_store_explicit(&node->busy, 0, memory_order_release);
     }
 
     LOG_I("node %s worker stopped", node->name);
