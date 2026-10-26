@@ -87,24 +87,11 @@ static int cfg_log_level(const cJSON *item, int fallback)
     return fallback;
 }
 
-static int cfg_run_mode(const cJSON *item, int fallback)
-{
-    if (!item) return fallback;
-    if (cJSON_IsNumber(item)) return item->valueint == 1 ? 1 : 0;
-    if (!cJSON_IsString(item) || !item->valuestring) return fallback;
-    if (strcasecmp(item->valuestring, "photo") == 0 ||
-        strcasecmp(item->valuestring, "capture") == 0) return 1;
-    if (strcasecmp(item->valuestring, "live") == 0 ||
-        strcasecmp(item->valuestring, "realtime") == 0) return 0;
-    return fallback;
-}
-
 /** @brief 集中设置所有缺省参数，JSON 缺少某字段时保留对应默认值。 */
 static void config_defaults(ocr_config_t *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
     snprintf(cfg->app_name, sizeof(cfg->app_name), "%s", "ocr_translator");
-    cfg->run_mode = 0;
     cfg->log_level = 1;
     snprintf(cfg->v4l2_device, sizeof(cfg->v4l2_device), "%s", "/dev/video0");
     cfg->capture_width = 1920;
@@ -209,8 +196,6 @@ int config_load(ocr_config_t *cfg, const char *path)
 
     /* 兼容旧版顶层字段。 */
     cfg_strcpy(cfg->app_name, sizeof(cfg->app_name), root, "app_name");
-    cfg->run_mode = cfg_run_mode(cJSON_GetObjectItemCaseSensitive(root, "run_mode"),
-                                 cfg->run_mode);
     cfg->log_level = cfg_log_level(cJSON_GetObjectItemCaseSensitive(root, "log_level"),
                                    cfg->log_level);
     cfg_strcpy(cfg->log_path, sizeof(cfg->log_path), root, "log_path");
@@ -219,8 +204,6 @@ int config_load(ocr_config_t *cfg, const char *path)
     const cJSON *app = cJSON_GetObjectItemCaseSensitive(root, "app");
     if (app && cJSON_IsObject(app)) {
         cfg_strcpy(cfg->app_name, sizeof(cfg->app_name), app, "name");
-        cfg->run_mode = cfg_run_mode(cJSON_GetObjectItemCaseSensitive(app, "mode"),
-                                     cfg->run_mode);
         cfg->log_level = cfg_log_level(cJSON_GetObjectItemCaseSensitive(app, "log_level"),
                                        cfg->log_level);
         cfg_strcpy(cfg->log_path, sizeof(cfg->log_path), app, "log_file");
@@ -396,7 +379,7 @@ void config_dump(const ocr_config_t *cfg)
 {
     if (!cfg) return;
     LOG_I("==== 配置 dump ====");
-    LOG_I("app_name=%s run_mode=%d", cfg->app_name, cfg->run_mode);
+    LOG_I("app_name=%s", cfg->app_name);
     LOG_I("capture=%ux%u@%u %s buffers=%d dev=%s", cfg->capture_width,
           cfg->capture_height, cfg->capture_fps, cfg->capture_format,
           cfg->capture_buffer_count, cfg->v4l2_device);

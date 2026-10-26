@@ -10,9 +10,8 @@
 
 #include "drm_device.h"
 #include "drm_plane.h"
+#include "text_renderer.h"
 #include <stddef.h>
-#include <ft2build.h>
-#include FT_FREETYPE_H
 
 #define OVERLAY_MAX_TEXT 256
 
@@ -20,9 +19,7 @@
 typedef struct {
     ocr_drm_device_t *dev; /**< 借用的 DRM 设备，须在 overlay 销毁及双缓冲退出扫描后再关闭。 */
     ocr_drm_planes_t *planes; /**< 借用的 plane 管理器，使用其可选 overlay；本模块不销毁管理器。 */
-    FT_Library        ft_lib; /**< 本实例初始化的 FreeType 库句柄，destroy 时在字体 face 之后释放。 */
-    FT_Face           ft_face; /**< 本实例加载的字体 face，承载字形及字号设置；destroy 释放。 */
-    int               font_size; /**< FT_Set_Pixel_Sizes 使用的像素字号，不是印刷 point。 */
+    ocr_text_renderer_t text; /**< 本实例独占的文字渲染器（字体与字号），只由显示线程使用；destroy 释放。 */
     uint32_t          width; /**< 文字层有效宽度，屏幕像素，用于字形裁边和 dumb buffer 分配。 */
     uint32_t          height; /**< 文字层有效高度，屏幕像素，与视频层共同映射到显示区域。 */
     uint32_t          pitch[2]; /**< 两块 ARGB 缓冲各自的字节行跨度，内核可能加入对齐；逐行绘制必须使用。 */

@@ -1,6 +1,5 @@
 {
   "app": {
-    "mode": "live",
     "log_level": "info",
     "log_file": "/var/log/ocr_translator.log"
   },

@@ -13,7 +13,6 @@
 /** 配置根结构体 */
 typedef struct {
     char     app_name[64]; /**< 日志使用的应用名称，含 NUL，不是可执行文件路径。 */
-    int      run_mode; /**< 业务模式：0 实时 OCR/翻译，1 按键拍照；决定由哪个线程独占模型。 */
     int      log_level; /**< 最小日志等级，0 DEBUG、1 INFO、2 WARN、3 ERROR、4 FATAL。 */
     char     log_path[256]; /**< 日志文件路径，含 NUL；空字符串表示使用 stderr。 */
 

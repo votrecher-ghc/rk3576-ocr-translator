@@ -5,6 +5,7 @@ set(DISPLAY_SRC
     drm_fb.c
     drm_sink.c
     drm_overlay.c
+    text_renderer.c
 )
 
 # pkg-config 不可用时也从 toolchain/sysroot 中定位 ft2build.h。

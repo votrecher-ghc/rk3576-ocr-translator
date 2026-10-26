@@ -1,11 +1,13 @@
 /** @file main.c @brief RK3576 OCR translator application orchestration.
  *
  * 程序装配入口：读取配置，初始化设备和模型，连接采集/RGA/显示/OCR，最后按依赖释放资源。
- * 实时模式由 OCR 工作线程使用模型；拍照模式由按键会话使用模型，两者互斥以避免共享上下文并发推理。
+ * 实时预览翻译一直运行；按键随时登记拍照，由 OCR 线程把下一次识别完成的帧连同译文存档。
+ * 模型只由 OCR 工作线程使用，不需要跨线程加锁。
  */
 #include "system_manager.h"
 #include "config.h"
 #include "log.h"
+#include "timestamp.h"
 
 #include "v4l2_capture.h"
 #include "imx415_ctrl.h"
@@ -48,6 +50,10 @@
 #include <unistd.h>
 
 #define LIVE_OVERLAY_MAX_ITEMS 32
+#define OVERLAY_TEXT_COLOR 0xEFFFFFFFU /* 识别结果文字颜色，屏幕文字层与拍照合成共用 */
+#define STATUS_ERROR_COLOR 0xEFFF6050U /* 角落提示在保存失败时的颜色 */
+#define STATUS_SHOW_MS 2000U           /* 角落提示的显示时长，毫秒 */
+#define STATUS_MARGIN 16               /* 角落提示距屏幕左、下边缘的像素 */
 
 /*
  * V4L2 和 IIO 都使用 CLOCK_MONOTONIC 时间戳。若实测发现图像相对陀螺仪
@@ -67,7 +73,8 @@ typedef struct {
     int rec; /**< 识别模型及词表初始化成功标记，cleanup 据此销毁。 */
     int translator; /**< 翻译资产及模型可用标记；为 0 时按配置降级或拒绝启动。 */
     int archive; /**< 归档器初始化成功标记，控制结果保存与存储清理。 */
-    int key; /**< 拍照 input 监听器初始化成功标记，先停止其会话再释放模型资源。 */
+    int session; /**< 拍照会话（请求标记与合成字体）初始化成功标记，按键与 OCR 线程都停止后销毁。 */
+    int key; /**< 拍照 input 监听器初始化成功标记；监听线程只登记请求，退出时最先停止。 */
     int pipeline; /**< 管线管理结构已初始化标记，包含部分装配时也据此执行回滚清理。 */
     int output_pool; /**< 独立 RGA 输出池已建立标记，必须等 worker/显示都释放引用后销毁。 */
     int sink; /**< 视频显示 sink 初始化成功标记，退出时先解除扫描再归还 current 引用。 */
@@ -80,6 +87,9 @@ typedef struct {
     int x[LIVE_OVERLAY_MAX_ITEMS]; /**< 对应 text 的屏幕横向绘制起点，像素，由检测框最小 x 得到。 */
     int y[LIVE_OVERLAY_MAX_ITEMS]; /**< 对应 text 的屏幕纵向绘制起点，像素，由检测框最小 y 得到。 */
     int count; /**< 当前有效文字项数，0..LIVE_OVERLAY_MAX_ITEMS；0 也表示需清掉旧文字的结果。 */
+    char status[64]; /**< 屏幕角落的拍照提示，空串表示无提示；与文字结果一起受 lock 保护。 */
+    uint32_t status_color; /**< 角落提示的 straight 0xAARRGGBB 颜色。 */
+    uint64_t status_until_ms; /**< 提示到期的单调时钟毫秒；显示线程到期后清除并递增版本号以擦掉它。 */
     uint64_t generation; /**< 每次完整发布结果后递增的版本号；不是视频 frame_id，不保证逐帧对应。 */
     uint64_t presented_generation; /**< 显示线程最近成功提交的文字版本；小于 generation 时需更新。 */
 } live_overlay_state_t;
@@ -90,6 +100,8 @@ typedef struct {
     char text[LIVE_OVERLAY_MAX_ITEMS][OCR_MAX_TEXT_LEN]; /**< 文字的栈上值副本，使耗时绘制可在共享锁之外执行。 */
     int x[LIVE_OVERLAY_MAX_ITEMS]; /**< 本快照各项的横向绘制起点，像素，与 text 行一一对应。 */
     int y[LIVE_OVERLAY_MAX_ITEMS]; /**< 本快照各项的纵向绘制起点，像素；不借用共享数组地址。 */
+    char status[64]; /**< 本快照的角落提示副本，空串表示不画。 */
+    uint32_t status_color; /**< 角落提示颜色。 */
 } overlay_snapshot_t;
 
 static ocr_config_t g_config;
@@ -118,6 +130,7 @@ static ocr_fan_ctrl_t g_fan;
 static int g_light_ready, g_brightness_ready, g_temp_ready, g_fan_ready;
 static int g_fan_kernel_managed;
 static ocr_key_event_t_ctx g_key;
+static int g_key_failed; /* 按键线程启动失败或意外退出后置 1：拍照已禁用，主循环只记录一次。 */
 static ocr_capture_session_t g_session;
 static ocr_archiver_t g_archiver;
 static ocr_storage_mgr_t g_storage;
@@ -134,7 +147,6 @@ static void print_usage(const char *program)
     fprintf(stderr,
             "Usage: %s [options]\n"
             "  -c, --config FILE   configuration (default /etc/ocr/ocr_translator.json)\n"
-            "  -m, --mode MODE     live|photo|0|1\n"
             "  -l, --log LEVEL     debug|info|warn|error|fatal|0..4\n"
             "  -d, --debug         enable debug logging\n"
             "  -h, --help          show this help\n", program);
@@ -158,41 +170,23 @@ static int parse_level(const char *text, int *level)
     return 0;
 }
 
-static int parse_mode(const char *text, int *mode)
-{
-    if (!text || !mode) return -1;
-    if (strcasecmp(text, "live") == 0 || strcmp(text, "0") == 0) {
-        *mode = 0;
-        return 0;
-    }
-    if (strcasecmp(text, "photo") == 0 || strcasecmp(text, "capture") == 0 ||
-        strcmp(text, "1") == 0) {
-        *mode = 1;
-        return 0;
-    }
-    return -1;
-}
-
 static int parse_args(int argc, char **argv, const char **config_path,
-                      int *mode_override, int *level_override)
+                      int *level_override)
 {
     static const struct option options[] = {
         {"config", required_argument, NULL, 'c'},
-        {"mode", required_argument, NULL, 'm'},
         {"log", required_argument, NULL, 'l'},
         {"debug", no_argument, NULL, 'd'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0},
     };
     *config_path = "/etc/ocr/ocr_translator.json";
-    *mode_override = -1;
     *level_override = -1;
 
     int option;
-    while ((option = getopt_long(argc, argv, "c:m:l:dh", options, NULL)) != -1) {
+    while ((option = getopt_long(argc, argv, "c:l:dh", options, NULL)) != -1) {
         switch (option) {
         case 'c': *config_path = optarg; break;
-        case 'm': if (parse_mode(optarg, mode_override) != 0) return -1; break;
         case 'l': if (parse_level(optarg, level_override) != 0) return -1; break;
         case 'd': *level_override = LOG_LEVEL_DEBUG; break;
         case 'h': print_usage(argv[0]); return 1;
@@ -365,48 +359,46 @@ static int init_ai(const ocr_config_t *config)
     return 0;
 }
 
-/** @brief 准备归档和拍照按键；只有拍照模式接入按键会话以避免模型并发使用。 */
-static int init_archive_and_input(const ocr_config_t *config)
+/**
+ * @brief 准备归档和拍照按键；任何一步不可用都只禁用拍照，实时预览照常运行。
+ * @note 按键线程只登记请求，识别和存档由实时 OCR 线程在下一次识别完成后执行，
+ *       所以模型始终只有 OCR 线程使用，按键线程不推理。
+ */
+static void init_archive_and_input(const ocr_config_t *config)
 {
     char discovered_key[64];
     const char *key_path = config->key_device;
 
-    if (ocr_archiver_init(&g_archiver, config->archive_dir) == 0) {
-        g_init.archive = 1;
-        (void)ocr_storage_mgr_init(&g_storage, config->archive_dir,
-                                   config->archive_max_percent);
-    } else {
-        LOG_W("archive directory unavailable; photo mode cannot save results");
-        if (config->run_mode == 1) return -1;
+    if (ocr_archiver_init(&g_archiver, config->archive_dir) != 0) {
+        LOG_W("归档目录 %s 不可用，按键拍照已禁用", config->archive_dir);
+        return;
     }
+    g_init.archive = 1;
+    (void)ocr_storage_mgr_init(&g_storage, config->archive_dir,
+                               config->archive_max_percent);
 
-    /* Live OCR owns the single RKNN context on its worker thread.  Photo mode
-     * is mutually exclusive so the key thread can safely run a synchronous
-     * capture session with those same model objects. */
-    if (config->run_mode != 1) return 0;
-
-    if (ocr_capture_session_init(&g_session, &g_capture, &g_det, &g_rec,
-                                 &g_translator,
-                                 g_init.archive ? &g_archiver : NULL) != 0)
-        return -1;
+    if (ocr_capture_session_init(&g_session, &g_archiver, config->font_path,
+                                 config->font_size) != 0) {
+        LOG_W("拍照会话初始化失败，按键拍照已禁用");
+        return;
+    }
+    g_init.session = 1;
     (void)ocr_capture_session_configure(&g_session, config->src_lang,
                                         config->tgt_lang,
                                         config->jpeg_quality);
     if (is_auto_device(key_path)) {
         if (ocr_key_event_find_device(discovered_key, sizeof(discovered_key)) != 0) {
-            LOG_E("未发现支持 KEY_CAMERA 的 input 设备");
-            return -2;
+            LOG_W("未发现支持 KEY_CAMERA 的 input 设备，按键拍照已禁用");
+            return;
         }
         key_path = discovered_key;
     }
     if (ocr_key_event_init(&g_key, key_path,
-                           ocr_capture_session_on_key, &g_session) == 0) {
-        g_init.key = 1;
-    } else {
-        LOG_E("photo mode requires a working KEY_CAMERA input device");
-        return -2;
+                           ocr_capture_session_on_key, &g_session) != 0) {
+        LOG_W("按键设备 %s 打开失败，按键拍照已禁用", key_path);
+        return;
     }
-    return 0;
+    g_init.key = 1;
 }
 
 static int capture_frame(ocr_buffer_t *buffer, void *user_data)
@@ -547,26 +539,38 @@ static int rga_process(ocr_pipeline_node_t *node, ocr_buffer_t *input)
     return 1;
 }
 
-/** @brief 在互斥锁内发布完整识别结果快照及版本号，供显示线程下一次刷新读取。 */
-static void publish_overlay(const ocr_text_box_list_t *boxes,
-                            char (*texts)[OCR_MAX_TEXT_LEN],
-                            char (*translated)[OCR_MAX_TEXT_LEN])
+/** @brief 按屏幕规则排好要显示的文字：有译文显示译文，否则显示原文，起点取检测框左上角。 */
+static void layout_overlay(const ocr_text_box_list_t *boxes,
+                           char (*texts)[OCR_MAX_TEXT_LEN],
+                           char (*translated)[OCR_MAX_TEXT_LEN],
+                           overlay_snapshot_t *layout)
 {
-    ocr_mutex_lock(&g_overlay_state.lock);
     int count = boxes->count;
     if (count > LIVE_OVERLAY_MAX_ITEMS) count = LIVE_OVERLAY_MAX_ITEMS;
-    g_overlay_state.count = count;
+    layout->count = count;
     for (int i = 0; i < count; ++i) {
         const char *value = translated[i][0] ? translated[i] : texts[i];
-        snprintf(g_overlay_state.text[i], sizeof(g_overlay_state.text[i]),
-                 "%s", value);
+        snprintf(layout->text[i], sizeof(layout->text[i]), "%s", value);
         float min_x = boxes->boxes[i].x[0], min_y = boxes->boxes[i].y[0];
         for (int p = 1; p < OCR_BOX_POINTS; ++p) {
             if (boxes->boxes[i].x[p] < min_x) min_x = boxes->boxes[i].x[p];
             if (boxes->boxes[i].y[p] < min_y) min_y = boxes->boxes[i].y[p];
         }
-        g_overlay_state.x[i] = (int)fmaxf(0.0f, min_x);
-        g_overlay_state.y[i] = (int)fmaxf(0.0f, min_y);
+        layout->x[i] = (int)fmaxf(0.0f, min_x);
+        layout->y[i] = (int)fmaxf(0.0f, min_y);
+    }
+}
+
+/** @brief 在互斥锁内发布完整识别结果快照及版本号，供显示线程下一次刷新读取。 */
+static void publish_overlay(const overlay_snapshot_t *layout)
+{
+    ocr_mutex_lock(&g_overlay_state.lock);
+    g_overlay_state.count = layout->count;
+    for (int i = 0; i < layout->count; ++i) {
+        memcpy(g_overlay_state.text[i], layout->text[i],
+               sizeof(g_overlay_state.text[i]));
+        g_overlay_state.x[i] = layout->x[i];
+        g_overlay_state.y[i] = layout->y[i];
     }
     /* 所有文本/坐标更新完成后再递增版本号；显示线程拿同一把锁复制快照，
      * 不会看到新 count 配上未更新的旧文本。此版本不是摄像头的 frame_id。 */
@@ -574,7 +578,43 @@ static void publish_overlay(const ocr_text_box_list_t *boxes,
     ocr_mutex_unlock(&g_overlay_state.lock);
 }
 
-/** @brief 借用 RGA 输出，执行 CPU 预处理和模型推理，发布文本后结束 CPU 读访问。 */
+/** @brief 在屏幕角落显示一条短暂提示；到期后由显示线程清除。 */
+static void publish_status(const char *text, uint32_t color)
+{
+    ocr_mutex_lock(&g_overlay_state.lock);
+    snprintf(g_overlay_state.status, sizeof(g_overlay_state.status), "%s", text);
+    g_overlay_state.status_color = color;
+    g_overlay_state.status_until_ms = timestamp_ms() + STATUS_SHOW_MS;
+    ++g_overlay_state.generation;
+    ocr_mutex_unlock(&g_overlay_state.lock);
+}
+
+/** @brief 把本轮识别的帧和结果存成照片，译文按屏幕文字层的内容和位置画上去。 */
+static void save_photo(const ocr_buffer_t *frame, const ocr_text_box_list_t *boxes,
+                       char (*texts)[OCR_MAX_TEXT_LEN],
+                       char (*translated)[OCR_MAX_TEXT_LEN],
+                       const overlay_snapshot_t *layout)
+{
+    ocr_capture_label_t labels[LIVE_OVERLAY_MAX_ITEMS];
+    for (int i = 0; i < layout->count; ++i) {
+        labels[i].text = layout->text[i];
+        labels[i].x = layout->x[i];
+        labels[i].y = layout->y[i];
+    }
+    int ret = ocr_capture_session_save(&g_session, frame, boxes, texts, translated,
+                                       labels, layout->count, OVERLAY_TEXT_COLOR);
+    if (ret == 0) {
+        publish_status("已保存", OVERLAY_TEXT_COLOR);
+    } else {
+        LOG_W("拍照保存失败: %d", ret);
+        publish_status("保存失败", STATUS_ERROR_COLOR);
+    }
+}
+
+/**
+ * @brief 借用 RGA 输出，执行 CPU 预处理和模型推理，发布文本后结束 CPU 读访问。
+ * @note 有拍照请求时，把这一帧连同本轮结果存档；模型只在本线程使用。
+ */
 static int ocr_process(ocr_pipeline_node_t *node, ocr_buffer_t *buffer)
 {
     (void)node;
@@ -617,7 +657,14 @@ static int ocr_process(ocr_pipeline_node_t *node, ocr_buffer_t *buffer)
     }
     /* START/END 覆盖整个同步 OCR 回调，包括预处理和模型执行。
      * END 完成也没有归还图像；输入引用由工作线程随后 unref，显示端的引用独立存在。 */
-    publish_overlay(&boxes, texts, translated);
+    overlay_snapshot_t layout;
+    layout_overlay(&boxes, texts, translated, &layout);
+    publish_overlay(&layout);
+    /* 识别成功后才取走拍照请求：前面任何一步失败都会提前返回，请求留给下一帧。
+     * 这块 B 仍由本线程持有引用、CPU 读同步也未结束，屏幕虽已换到更新的画面，
+     * 它的内容不会被 RGA 覆盖，照片画面与本轮识别结果严格对应。 */
+    if (g_init.session && ocr_capture_session_take_request(&g_session))
+        save_photo(buffer, &boxes, texts, translated, &layout);
     if (buffer->fd >= 0) (void)ocr_zerocopy_sync(buffer->fd, 1);
     free(text_ptrs);
     free(translated);
@@ -637,6 +684,12 @@ static int display_process(ocr_pipeline_node_t *node, ocr_buffer_t *buffer)
     overlay_snapshot_t snapshot;
     memset(&snapshot, 0, sizeof(snapshot));
     ocr_mutex_lock(&g_overlay_state.lock);
+    /* 角落提示到期：清掉并递增版本号，下面按新版本重画一次即可擦掉它。 */
+    if (g_overlay_state.status[0] &&
+        timestamp_ms() >= g_overlay_state.status_until_ms) {
+        g_overlay_state.status[0] = '\0';
+        ++g_overlay_state.generation;
+    }
     if (g_overlay_state.generation != g_overlay_state.presented_generation) {
         snapshot.count = g_overlay_state.count;
         snapshot.generation = g_overlay_state.generation;
@@ -646,6 +699,8 @@ static int display_process(ocr_pipeline_node_t *node, ocr_buffer_t *buffer)
             snapshot.x[i] = g_overlay_state.x[i];
             snapshot.y[i] = g_overlay_state.y[i];
         }
+        memcpy(snapshot.status, g_overlay_state.status, sizeof(snapshot.status));
+        snapshot.status_color = g_overlay_state.status_color;
     }
     ocr_mutex_unlock(&g_overlay_state.lock);
     /* 0 表示这次没有新快照，保留当前文字层；新快照 count=0 则仍需 clear，
@@ -655,7 +710,16 @@ static int display_process(ocr_pipeline_node_t *node, ocr_buffer_t *buffer)
     (void)ocr_overlay_clear(&g_overlay);
     for (int i = 0; i < snapshot.count; ++i)
         (void)ocr_overlay_render_text(&g_overlay, snapshot.text[i],
-                                      snapshot.x[i], snapshot.y[i], 0xEFFFFFFFU);
+                                      snapshot.x[i], snapshot.y[i],
+                                      OVERLAY_TEXT_COLOR);
+    if (snapshot.status[0]) {
+        /* 文字起点是左上角、基线在 y + 字号，下沿再留出约 1/4 字号给下伸部分。 */
+        int status_y = (int)g_overlay.height - STATUS_MARGIN -
+                       g_config.font_size - g_config.font_size / 4;
+        (void)ocr_overlay_render_text(&g_overlay, snapshot.status, STATUS_MARGIN,
+                                      status_y > 0 ? status_y : 0,
+                                      snapshot.status_color);
+    }
     /* 只有真正提交成功才推进 presented_generation；失败保持旧版本供下次重试。
      * 若绘制期间 OCR 已发布更新版本，这里只确认本次 snapshot 的版本，不吞掉新结果。 */
     if (ocr_overlay_commit(&g_overlay) == 0) {
@@ -667,8 +731,8 @@ static int display_process(ocr_pipeline_node_t *node, ocr_buffer_t *buffer)
     return 0;
 }
 
-/** @brief 创建输出池并连接采集到 RGA，再把同一输出分发给显示及可选 OCR 分支。 */
-static int init_pipeline(int live_ocr)
+/** @brief 创建输出池并连接采集到 RGA，再把同一输出分发给显示和 OCR 两个分支。 */
+static int init_pipeline(void)
 {
     /* 采集池由 V4L2 分配；这里另建四块 NV12 输出缓冲供 RGA 写入。
      * map_cpu=1 为 OCR 建立 CPU 映射，显示和 OCR 共享同一块输出图像。 */
@@ -692,17 +756,15 @@ static int init_pipeline(int live_ocr)
      * display 和 OCR 使用的是同一个 B，没有为两个分支另做整帧复制。 */
     if (ocr_node_link(&g_rga_node, &g_display_node) != 0) return -8;
 
-    if (live_ocr) {
-        /* OCR 一帧要几百毫秒，而输出池只有 4 块 B。若按队列排队，排着的每一帧都占住
-         * 一块 B，池被 OCR 占满后 RGA 取不到缓冲，屏幕也跟着停顿。仅空闲接收让 OCR
-         * 只处理识别完当时的最新一帧，最多占一块 B，显示保持摄像头帧率。 */
-        if (ocr_node_init(&g_ocr_node, "ocr", ocr_process, NULL) != 0 ||
-            ocr_node_set_idle_only(&g_ocr_node, 1) != 0 ||
-            ocr_pipeline_add(&g_pipeline, &g_ocr_node) != 0 ||
-            ocr_node_link(&g_rga_node, &g_ocr_node) != 0) return -9;
-    }
+    /* OCR 一帧要几百毫秒，而输出池只有 4 块 B。若按队列排队，排着的每一帧都占住
+     * 一块 B，池被 OCR 占满后 RGA 取不到缓冲，屏幕也跟着停顿。仅空闲接收让 OCR
+     * 只处理识别完当时的最新一帧，最多占一块 B，显示保持摄像头帧率。 */
+    if (ocr_node_init(&g_ocr_node, "ocr", ocr_process, NULL) != 0 ||
+        ocr_node_set_idle_only(&g_ocr_node, 1) != 0 ||
+        ocr_pipeline_add(&g_pipeline, &g_ocr_node) != 0 ||
+        ocr_node_link(&g_rga_node, &g_ocr_node) != 0) return -9;
     /* 摄像头有自己的采集线程，通过此回调接入第一个 RGA 节点，不是管线里的
-     * 一个普通 worker。live_ocr=0 时仅运行预览，模型由拍照会话独占使用。 */
+     * 一个普通 worker。 */
     return ocr_v4l2_set_frame_callback(&g_capture, capture_frame, &g_rga_node);
 }
 
@@ -717,14 +779,15 @@ static int run_application(void)
     if (g_init.imu && ocr_imu_reader_start(&g_imu) != 0)
         LOG_W("IMU worker failed; stabilization will use its last state");
     if (g_init.key && ocr_key_event_start(&g_key) != 0) {
-        LOG_E("camera key worker failed to start");
-        return -2;
+        LOG_W("camera key worker failed to start; key capture disabled");
+        g_key_failed = 1;
     }
     if (ocr_v4l2_start(&g_capture) != 0) return -3;
     if (ocr_system_manager_start_watchdog(&g_system, 5000) != 0) return -4;
 
     atomic_store(&g_system.state, SYS_STATE_RUNNING);
-    LOG_I("system running in %s mode", g_config.run_mode == 1 ? "photo" : "live");
+    LOG_I("system running: live OCR on, key capture %s",
+          g_init.key && !g_key_failed ? "on" : "off");
     while (!ocr_system_manager_should_exit(&g_system)) {
         if (!atomic_load(&g_capture.running) ||
             atomic_load(&g_capture.queue_error)) {
@@ -733,12 +796,11 @@ static int run_application(void)
             ocr_system_manager_request_exit(&g_system, 10);
             break;
         }
-        if (g_init.key && !ocr_key_event_is_running(&g_key)) {
-            int key_error = ocr_key_event_get_worker_error(&g_key);
-            LOG_E("camera key worker stopped unexpectedly (error=%d)",
-                  key_error);
-            ocr_system_manager_request_exit(&g_system, 12);
-            break;
+        /* 按键线程退出只影响拍照，实时预览和翻译继续运行；只记录一次。 */
+        if (g_init.key && !g_key_failed && !ocr_key_event_is_running(&g_key)) {
+            LOG_E("camera key worker stopped unexpectedly (error=%d); key capture disabled",
+                  ocr_key_event_get_worker_error(&g_key));
+            g_key_failed = 1;
         }
         /* running=1 不保证仍在产帧，因此另检查帧号是否持续变化。
          * get_latest 增加一份引用，检查完立即释放，不能让状态监控长期占住采集内存。 */
@@ -783,7 +845,7 @@ static int run_application(void)
 
 static void cleanup(void)
 {
-    /* 第一阶段阻止新业务进入：按键线程可能正在执行拍照推理，先等它结束；
+    /* 第一阶段阻止新业务进入：先停按键线程，不再产生新的拍照请求；
      * 随后停采集/IMU，避免节点销毁时仍有生产者入队。此时暂不关闭图像 fd。 */
     int key_stop_failed = g_init.key && ocr_key_event_stop(&g_key) != 0;
     if (g_init.capture) (void)ocr_v4l2_stop(&g_capture);
@@ -839,6 +901,8 @@ static void cleanup(void)
         LOG_E("RGA output pool still has outstanding references");
     if (g_init.overlay_state) ocr_mutex_destroy(&g_overlay_state.lock);
     if (g_init.key) ocr_key_event_destroy(&g_key);
+    /* 按键回调和 OCR 线程都已停止，才能释放会话的合成字体。 */
+    if (g_init.session) ocr_capture_session_destroy(&g_session);
     if (g_init.capture && ocr_v4l2_close(&g_capture) != 0)
         LOG_E("capture close deferred by outstanding references");
     if (g_init.imu) ocr_imu_reader_destroy(&g_imu);
@@ -858,9 +922,8 @@ static void cleanup(void)
 int main(int argc, char **argv)
 {
     const char *config_path;
-    int mode_override, level_override;
-    int parsed = parse_args(argc, argv, &config_path,
-                            &mode_override, &level_override);
+    int level_override;
+    int parsed = parse_args(argc, argv, &config_path, &level_override);
     if (parsed != 0) {
         if (parsed < 0) print_usage(argv[0]);
         return parsed > 0 ? 0 : 2;
@@ -869,7 +932,6 @@ int main(int argc, char **argv)
         fprintf(stderr, "failed to load configuration: %s\n", config_path);
         return 1;
     }
-    if (mode_override >= 0) g_config.run_mode = mode_override;
     if (init_logging(&g_config, level_override) != 0) {
         fprintf(stderr, "failed to initialize logging: %s\n",
                 g_config.log_path[0] ? g_config.log_path : "stderr");
@@ -886,8 +948,8 @@ int main(int argc, char **argv)
     if (ocr_system_manager_install_signals(&g_system) != 0) goto done;
     if (init_hardware(&g_config) != 0) goto done;
     if (init_ai(&g_config) != 0) goto done;
-    if (init_archive_and_input(&g_config) != 0) goto done;
-    if (init_pipeline(g_config.run_mode == 0) != 0) goto done;
+    init_archive_and_input(&g_config);
+    if (init_pipeline() != 0) goto done;
     result = run_application();
 
 done:

@@ -47,7 +47,6 @@ int main(void)
     CHECK(config_load(&cfg, OCR_TEST_CONFIG_PATH) == 0);
 
     CHECK(strcmp(cfg.app_name, "ocr_translator") == 0);
-    CHECK(cfg.run_mode == 0);
     CHECK(cfg.log_level == 1);
     CHECK(strcmp(cfg.log_path, "/var/log/ocr_translator.log") == 0);
 
