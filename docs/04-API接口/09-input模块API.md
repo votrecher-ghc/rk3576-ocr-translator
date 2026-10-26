@@ -4,6 +4,7 @@
 |---|---|---|---|
 | v1.0 | 2026-07-10 | 项目组 | 初始版本 |
 | v2.0 | 2026-07-16 | 项目组 | 删除不存在的 input_create API，对齐 KEY_CAMERA worker 与拍照会话 |
+| v2.1 | 2026-10-26 | 项目组 | 拍照会话改为“按键登记请求、OCR 线程存档”：删除 trigger，新增 request/take_request/save |
 
 ---
 
@@ -12,7 +13,7 @@
 | 文件 | 职责 |
 |---|---|
 | `app/input/key_event.h/.c` | 发现 evdev、读取 `KEY_CAMERA`、管理工作线程 |
-| `app/input/capture_session.h/.c` | 按键触发抓拍、JPEG、OCR、翻译和归档 |
+| `app/input/capture_session.h/.c` | 登记拍照请求；把实时识别完成的帧叠加译文编码为 JPEG，并写入 txt/json 归档 |
 
 内核和 overlay 上报 `KEY_CAMERA`。当前没有模式切换键、长按事件分类或通用
 `input_event_t` 分发层。
@@ -72,13 +73,17 @@ worker 读取完整 `struct input_event`，仅在 `EV_KEY/KEY_CAMERA` 时回调�
 ## 4. 拍照会话 API
 
 ```c
+typedef struct {
+    const char *text;   /* 借用的 UTF-8 文字，只在 save 期间使用 */
+    int x;              /* 文字左上角，帧像素坐标，与屏幕文字层相同 */
+    int y;
+} ocr_capture_label_t;
+
 int ocr_capture_session_init(
     ocr_capture_session_t *sess,
-    ocr_v4l2_capture_t *cap,
-    ocr_det_t *det,
-    ocr_rec_t *rec,
-    ocr_translator_t *trs,
-    ocr_archiver_t *arch);
+    ocr_archiver_t *arch,
+    const char *font_path,
+    int font_size);
 
 int ocr_capture_session_configure(
     ocr_capture_session_t *sess,
@@ -86,8 +91,20 @@ int ocr_capture_session_configure(
     const char *tgt_lang,
     int jpeg_quality);
 
-int ocr_capture_session_trigger(
-    ocr_capture_session_t *sess);
+void ocr_capture_session_request(ocr_capture_session_t *sess);
+int  ocr_capture_session_take_request(ocr_capture_session_t *sess);
+
+int ocr_capture_session_save(
+    ocr_capture_session_t *sess,
+    const ocr_buffer_t *frame,
+    const ocr_text_box_list_t *boxes,
+    char (*texts)[OCR_MAX_TEXT_LEN],
+    char (*translated)[OCR_MAX_TEXT_LEN],
+    const ocr_capture_label_t *labels,
+    int label_count,
+    uint32_t color);
+
+void ocr_capture_session_destroy(ocr_capture_session_t *sess);
 
 void ocr_capture_session_on_key(
     ocr_key_event_t event,
@@ -95,58 +112,76 @@ void ocr_capture_session_on_key(
     void *user);
 ```
 
-`trigger()` 返回：
+会话不推理、不取帧，只做两件事：记录拍照请求，以及把调用方给出的一帧和识别结果存档。
 
-- `0`：本次会话已执行；
-- `1`：已有会话忙碌，本次触发被忽略；
-- 负值：参数、抓拍、编码、OCR、翻译或归档失败。
+| 函数 | 调用线程 | 说明 |
+|---|---|---|
+| `init` | 主线程 | 借用归档器，加载合成译文用的字体；字体加载失败只告警，之后照片不带译文 |
+| `configure` | 主线程 | 设置归档语言标签和 JPEG 质量（1..100） |
+| `on_key` / `request` | 按键线程 | 仅 `KEY_EVENT_CAMERA + KEY_STATE_PRESSED` 登记请求；只置原子标记，立即返回；未取走前的多次请求合并为一次 |
+| `take_request` | OCR 线程 | 返回 1 并清除请求，或返回 0；应在一次识别成功完成后调用，识别失败时保留请求 |
+| `save` | OCR 线程 | 见下文 |
+| `destroy` | 主线程 | 释放字体；须在按键线程和 OCR 线程都停止后调用 |
 
-回调只在 `KEY_EVENT_CAMERA + KEY_STATE_PRESSED` 时触发会话。
+`save()` 的步骤：
+
+1. `ocr_archiver_create()` 建立 `<root>/YYYYMMDD/HHMMSS_mmm_<pid>_<序号>/`；
+2. 在与帧同尺寸的透明 premultiplied ARGB 图层上用 `text_renderer` 画出 `labels`；
+3. 逐行把帧转成 RGB、叠加图层（`out = 文字 + 画面 × (1 − α)`），编码为 `image.jpg`；
+4. 写 `result.txt`（原文 + 译文）和 `result.json`（框坐标、置信度、原文、译文）。
+
+`frame` 必须已 mmap，调用方负责在调用前后完成 DMA-BUF CPU 读同步。
+
+`save()` 返回：
+
+- `0`：成功；
+- `-1`：参数无效；
+- `-2`：建立归档目录失败；
+- `-3`：JPEG 编码失败；
+- `-4`：内存不足；
+- `-5`：写入 txt 或 json 失败。
+
+失败时已建立的目录和已写出的文件不回滚。
 
 ## 5. 线程安全
 
 - `ocr_key_event_t_ctx` 自己拥有 evdev worker。
 - `init/start/stop/destroy` 不应并发调用。
-- 回调运行在 key worker 线程中，不能执行会永久阻塞 stop/join 的操作。
-- `ocr_capture_session_t.busy` 使用原子状态阻止重入。
-- live OCR 与 photo 会话共享 RKNN 上下文时，必须使用主程序现有互斥策略。
-- `capture_session` 不是通用多线程任务队列；同一对象仅允许一个活动会话。
+- 回调运行在 key worker 线程中，只登记请求，不会阻塞 stop/join。
+- 请求标记是 `atomic_int`：按键线程写，OCR 线程用原子交换取走，二者无需加锁。
+- `save()` 只能由一个线程调用（实时 OCR 线程）；会话自带的 FreeType 实例不与显示线程共用。
+- RKNN 模型只由 OCR 线程使用，拍照不另做推理。
 
 ## 6. 示例
 
 ```c
+/* 主线程装配 */
 char key_path[64];
 ocr_key_event_t_ctx key;
 ocr_capture_session_t session;
 
-if (ocr_key_event_find_device(key_path, sizeof(key_path)) != 0)
+if (ocr_capture_session_init(&session, &archiver,
+                             font_path, font_size) != 0)
     return -1;
-
-if (ocr_capture_session_init(&session,
-                             &capture,
-                             &det,
-                             &rec,
-                             &translator,
-                             &archiver) != 0)
-    return -1;
-
 ocr_capture_session_configure(&session, "en", "zh", 90);
 
-if (ocr_key_event_init(&key,
-                       key_path,
-                       ocr_capture_session_on_key,
-                       &session) != 0)
-    return -1;
+if (ocr_key_event_find_device(key_path, sizeof(key_path)) != 0 ||
+    ocr_key_event_init(&key, key_path,
+                       ocr_capture_session_on_key, &session) != 0)
+    disable_key_capture();          /* 只禁用拍照，实时预览继续 */
+else
+    ocr_key_event_start(&key);
 
-if (ocr_key_event_start(&key) != 0)
-    return -1;
+/* OCR 线程：每识别完一帧 */
+publish_overlay(&layout);
+if (ocr_capture_session_take_request(&session))
+    ocr_capture_session_save(&session, frame, &boxes, texts, translated,
+                             labels, label_count, 0xEFFFFFFFU);
 
-/* 主循环周期检查 worker_error。 */
-if (ocr_key_event_get_worker_error(&key) < 0)
-    request_application_exit();
-
+/* 退出：先停按键，再停 OCR 线程，最后销毁会话 */
 ocr_key_event_stop(&key);
 ocr_key_event_destroy(&key);
+ocr_capture_session_destroy(&session);
 ```
 
 ---
