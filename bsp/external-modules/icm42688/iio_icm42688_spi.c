@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
+/**
+ * @file iio_icm42688_spi.c
+ * ICM42688 六轴驱动：SPI 读取加速度、角速度和芯片温度，提供直接读取及 IIO 触发缓冲。
+ * 数据就绪中断触发整组寄存器读取，扫描帧附加时间戳；用户态按 scan_elements 解码布局。
+ */
 /*
  * ICM-42688-P 6-axis IMU SPI IIO driver
  *
@@ -101,17 +106,17 @@
 #define ICM42688_TEMP_OFFSET_MILLI             25000
 
 struct icm42688_data {
-	struct spi_device *spi;
-	struct mutex lock;
-	struct iio_trigger *trig;
-	bool drdy_enabled;
+	struct spi_device *spi; /**< 借用 SPI core 设备，提供 SPI 模式、片选及总线传输入口。 */
+	struct mutex lock; /**< 串行化直接读、触发采样及电源/中断寄存器更新，SPI 同步操作可睡眠。 */
+	struct iio_trigger *trig; /**< devm 创建并注册的本设备 IIO 触发器；有板级数据就绪 IRQ 时建立。 */
+	bool drdy_enabled; /**< 最近成功配置的数据就绪中断使能状态，挂起/恢复路径据此处理。 */
 };
 
 struct icm42688_scan {
-	__be16 accel[3];
-	__be16 gyro[3];
-	__be16 temp;
-	s64 timestamp __aligned(8);
+	__be16 accel[3]; /**< x/y/z 加速度原始计数，保持大端 16 位扫描格式，不是已换算 SI 的 float。 */
+	__be16 gyro[3]; /**< x/y/z 角速度原始计数，大端 16 位；与 IIO 通道 scan_type/index 对应。 */
+	__be16 temp; /**< 芯片温度的大端 16 位原始计数，布局位于六轴数据之后。 */
+	s64 timestamp __aligned(8); /**< IIO 推入缓冲时附加的触发时间戳，纳秒；__aligned(8) 保证帧内 8 字节对齐。 */
 };
 
 enum icm42688_scan_index {
@@ -129,6 +134,7 @@ enum icm42688_scan_index {
  * The caller holds data->lock. The command phase and data phase belong to one
  * SPI message, so chip select remains asserted between the two transfers.
  */
+/* 调用者持锁；SPI 命令最高位置读标志，连续读取整段寄存器。 */
 static int icm42688_read_regs_locked(struct icm42688_data *data, u8 reg,
 				     void *rx_buf, size_t len)
 {
@@ -147,6 +153,9 @@ static int icm42688_read_regs_locked(struct icm42688_data *data, u8 reg,
 	if (!len)
 		return -EINVAL;
 
+	/* 两段 transfer 属于同一条 SPI message，命令与读数据之间保持片选。
+	 * sync 返回后传输已结束，栈上的 command/transfers 才能安全离开作用域；
+	 * 若拆成两个独立 message，片选边界会改变设备解读寄存器命令的方式。 */
 	return spi_sync_transfer(data->spi, transfers, ARRAY_SIZE(transfers));
 }
 
@@ -341,6 +350,7 @@ static const struct iio_info icm42688_iio_info = {
 	.read_raw = icm42688_read_raw,
 };
 
+/* 过滤芯片规定的无效采样哨兵值，避免将异常计数送入姿态融合。 */
 static bool icm42688_scan_is_valid(const struct icm42688_scan *scan)
 {
 	int i;
@@ -356,6 +366,7 @@ static bool icm42688_scan_is_valid(const struct icm42688_scan *scan)
 	return (s16)be16_to_cpu(scan->temp) != ICM42688_DATA_INVALID;
 }
 
+/* 在可睡眠的 IIO 触发处理阶段批量读传感器，重排扫描字段并附上触发时间戳。 */
 static irqreturn_t icm42688_trigger_handler(int irq, void *private)
 {
 	struct iio_poll_func *pf = private;
@@ -372,6 +383,9 @@ static irqreturn_t icm42688_trigger_handler(int irq, void *private)
 	if (ret)
 		goto out_done;
 
+	/* 寄存器顺序为 temp、accel、gyro，而 IIO 扫描顺序由通道 index 定义。
+	 * 分别搬到 scan 对应字段，同时保留寄存器的大端字节序供 scan_type 描述；
+	 * 不能把原始 burst 字节直接当成用户态的 imu_sample_t 发送。 */
 	memcpy(&scan.temp, &raw[0], sizeof(scan.temp));
 	memcpy(scan.accel, &raw[2], sizeof(scan.accel));
 	memcpy(scan.gyro, &raw[8], sizeof(scan.gyro));
@@ -381,10 +395,13 @@ static irqreturn_t icm42688_trigger_handler(int irq, void *private)
 					   pf->timestamp);
 
 out_done:
+	/* 包括 SPI 失败/采样无效在内，每次触发处理结束都必须通知 IIO，
+	 * 否则触发器可能持续认为上次消费未完成，后续中断不再正常推进缓冲。 */
 	iio_trigger_notify_done(indio_dev->trig);
 	return IRQ_HANDLED;
 }
 
+/* 随 IIO buffer 启停打开或关闭芯片数据就绪中断，并记录实际状态。 */
 static int icm42688_set_trigger_state(struct iio_trigger *trig, bool state)
 {
 	struct icm42688_data *data = iio_trigger_get_drvdata(trig);
@@ -488,6 +505,7 @@ static void icm42688_power_down(void *private)
 	mutex_unlock(&data->lock);
 }
 
+/* 把板级 IRQ 接入 IIO 自有触发器；未配置 IRQ 时不建立数据就绪触发。 */
 static int icm42688_setup_irq_trigger(struct device *dev,
 				      struct iio_dev *indio_dev)
 {
@@ -521,6 +539,7 @@ static int icm42688_setup_irq_trigger(struct device *dev,
 	return iio_trigger_set_immutable(indio_dev, data->trig);
 }
 
+/* 配置 SPI、初始化芯片、注册触发缓冲及 IIO 设备；devm 在失败时逆序释放资源。 */
 static int icm42688_probe(struct spi_device *spi)
 {
 	struct device *dev = &spi->dev;

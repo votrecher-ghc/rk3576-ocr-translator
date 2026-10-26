@@ -1,6 +1,9 @@
 /**
  * @file log.c
  * @brief 日志系统实现
+ *
+ * 线程安全日志：按级别过滤，记录时间、模块和源码位置，输出到标准错误或指定文件。
+ * 全局锁串行化日志状态和输出；初始化/关闭文件句柄时也遵守同一把锁。
  */
 #include "log.h"
 
@@ -22,11 +25,11 @@ static const char *s_level_color[] = {
 #define COLOR_RESET "\033[0m"
 
 static struct {
-    char          name[32];   /* 模块名 */
-    log_level_t   level;      /* 最小输出级别 */
-    FILE         *fp;         /* 输出文件 */
-    int           use_color;  /* 是否启用颜色（终端） */
-    int           inited;     /* 是否已初始化 */
+    char          name[32]; /**< 当前日志标签的值副本，最多 31 字节加 NUL；输出每条日志时读取。 */
+    log_level_t   level; /**< 最小输出等级，初始化可受 LOG_LEVEL 环境变量覆盖；受全局 s_log_lock 保护。 */
+    FILE         *fp; /**< 输出流，stderr 为借用，fopen 的日志文件由本模块关闭；不是同时输出两个目标。 */
+    int           use_color; /**< 输出为终端 stderr 时可启用 ANSI 颜色，日志文件输出关闭颜色。 */
+    int           inited; /**< 日志配置可用标志；与其他日志字段一起由 s_log_lock 保护。 */
 } s_log;
 
 static pthread_mutex_t s_log_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -36,6 +39,7 @@ static int valid_level(log_level_t level)
     return level >= LOG_LEVEL_DEBUG && level <= LOG_LEVEL_FATAL;
 }
 
+/** @brief 解析环境变量指定的日志级别，非法值回退到调用方给定级别。 */
 static log_level_t level_from_env(log_level_t fallback)
 {
     const char *value = getenv("LOG_LEVEL");
@@ -112,6 +116,7 @@ void log_set_level(log_level_t level)
     pthread_mutex_unlock(&s_log_lock);
 }
 
+/** @brief 在全局锁内读取配置并写出一条完整日志，避免多线程日志相互交错。 */
 int log_write(log_level_t level, const char *file, int line,
               const char *func, const char *fmt, ...)
 {

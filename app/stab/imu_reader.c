@@ -1,6 +1,9 @@
 /**
  * @file imu_reader.c
  * @brief IMU reader backed by a discoverable IIO triggered-buffer layout.
+ *
+ * IIO 采样读取：独占设备控制、配置 scan 通道、发现二进制布局，然后在线程中解码完整扫描帧。
+ * 读取值按通道 scale 转成 SI 单位，经 SPSC 队列交给姿态融合；停止时先结束读取并禁用 IIO buffer。
  */
 #include "imu_reader.h"
 #include "log.h"
@@ -122,6 +125,7 @@ static int write_long_file(const char *path, long value)
     return write_text_file(path, text);
 }
 
+/** @brief 按 IIO 设备取得进程间独占锁，避免多个进程同时修改扫描通道和 buffer 状态。 */
 static int acquire_device_lock(ocr_imu_reader_t *reader, const char *dev_path)
 {
     const char *basename;
@@ -191,6 +195,7 @@ static unsigned int required_scan_bit(const char *name)
     return 0;
 }
 
+/** @brief 只启用必需通道，验证加速度、角速度、温度及时间戳扫描字段完整。 */
 static int configure_scan_elements(ocr_imu_reader_t *reader)
 {
     char scan_dir[OCR_IMU_SYSFS_PATH_LEN + 32];
@@ -237,6 +242,7 @@ static int configure_scan_elements(ocr_imu_reader_t *reader)
 
 static int set_iio_buffer_enabled(ocr_imu_reader_t *reader, int enabled);
 
+/** @brief 清理遗留启用状态、核对触发器，再配置扫描通道和内核缓冲深度。 */
 static int prepare_iio_buffer(ocr_imu_reader_t *reader, int depth)
 {
     char path[OCR_IMU_SYSFS_PATH_LEN + 48];
@@ -314,6 +320,7 @@ static int parse_unsigned(const char **cursor, unsigned long *value)
     return 0;
 }
 
+/** @brief 解析 IIO 类型文本中的字节序、有符号位、有效位、存储位宽及移位。 */
 static int parse_scan_type(const char *text, ocr_imu_scan_channel_t *channel)
 {
     const char *cursor;
@@ -324,6 +331,8 @@ static int parse_scan_type(const char *text, ocr_imu_scan_channel_t *channel)
     int big_endian;
 
     if (!text || !channel) return -1;
+    /* 例 be:s16/16>>0 表示大端、有符号、16 个有效位装在 16 位存储中。
+     * storage_bits 决定帧内占用/对齐，real_bits 和 shift 决定如何提取值，两者不能混用。 */
     cursor = text;
     if (strncmp(cursor, "le:", 3) == 0) {
         big_endian = 0;
@@ -472,6 +481,7 @@ static int scale_to_micro(double scale)
     return (int)llround(value);
 }
 
+/** @brief 按 scan index 排序并计算通道对齐偏移，不能假定内核扫描帧等于某个 C 结构体。 */
 static int discover_scan_layout(ocr_imu_reader_t *reader)
 {
     char scan_dir[OCR_IMU_SYSFS_PATH_LEN + 32];
@@ -598,6 +608,9 @@ static int discover_scan_layout(ocr_imu_reader_t *reader)
         return -1;
     }
 
+    /* sysfs 目录枚举顺序不是二进制帧顺序，必须按 _index 重新排序。
+     * 每个字段按自身 storage_bytes 对齐，帧尾再按最大对齐值补齐；时间戳
+     * 常为 8 字节，因此不能简单紧挨着前面的 16 位传感器字段读取。 */
     qsort(reader->scan_channels, (size_t)reader->scan_channel_count,
           sizeof(reader->scan_channels[0]), scan_channel_compare);
     for (int i = 0; i < reader->scan_channel_count; ++i) {
@@ -646,6 +659,7 @@ static int derive_sysfs_path(ocr_imu_reader_t *reader, const char *dev_path)
     return written >= 0 && (size_t)written < sizeof(reader->sysfs_path) ? 0 : -1;
 }
 
+/** @brief 按发现的字节序和位宽提取原始值，再处理移位与符号扩展。 */
 static int decode_scan_value(const uint8_t *frame, size_t frame_size,
                              const ocr_imu_scan_channel_t *channel,
                              int64_t *decoded)
@@ -659,6 +673,8 @@ static int decode_scan_value(const uint8_t *frame, size_t frame_size,
         channel->storage_bytes > frame_size - channel->offset) {
         return -1;
     }
+    /* 按字节组装而非强转 int16_t/int64_t 指针，同时处理端序和未对齐访问。
+     * 通道偏移以 discover_scan_layout 的结果为准，不依赖主机结构体 padding。 */
     data = frame + channel->offset;
     if (channel->is_big_endian) {
         for (uint8_t i = 0; i < channel->storage_bytes; ++i) {
@@ -669,6 +685,8 @@ static int decode_scan_value(const uint8_t *frame, size_t frame_size,
             value |= (uint64_t)data[i] << (8U * i);
         }
     }
+    /* 先移掉无效低位，再用有效位掩码截取；real_bits=64 单独处理，避免 1<<64
+     * 的未定义行为。符号位位于 real_bits-1，不一定在存储字节的最高位。 */
     value >>= channel->shift;
     mask = channel->real_bits == 64 ? UINT64_MAX :
            ((UINT64_C(1) << channel->real_bits) - 1U);
@@ -677,6 +695,8 @@ static int decode_scan_value(const uint8_t *frame, size_t frame_size,
     if (channel->is_signed &&
         (value & (UINT64_C(1) << (channel->real_bits - 1U)))) {
         int64_t signed_value;
+        /* 有符号负数把有效位以上全部补 1，再复制位模式到 int64_t。
+         * 例如有效 12 位的 0xfff 应是 -1，而不是十进制 4095。 */
         value |= ~mask;
         memcpy(&signed_value, &value, sizeof(signed_value));
         *decoded = signed_value;
@@ -694,6 +714,7 @@ static int16_t clamp_i16(int64_t value)
     return (int16_t)value;
 }
 
+/** @brief 解码一帧 IIO 数据，同时保留原始值、兼容整数值和供融合使用的 SI 单位值。 */
 static int parse_scan_frame(const ocr_imu_reader_t *reader,
                             const uint8_t *frame, imu_sample_t *sample)
 {
@@ -712,6 +733,8 @@ static int parse_scan_frame(const ocr_imu_reader_t *reader,
             if (!isfinite(scaled) || fabs(scaled) > FLT_MAX) return -1;
             sample->accel_raw[channel->axis] = raw;
             sample->accel[channel->axis] = clamp_i16(raw);
+            /* 姿态融合读取 SI 值，不能拿兼容字段 accel[] 的整数值直接积分。
+             * 原始计数另存 accel_raw，clamp_i16 只为旧接口提供有界表示。 */
             sample->accel_si[channel->axis] = (float)scaled;
         } else if (channel->kind == OCR_IMU_SCAN_GYRO) {
             scaled = (double)raw * channel->scale;
@@ -789,6 +812,7 @@ int ocr_imu_reader_init(ocr_imu_reader_t *reader, const char *dev_path,
     return 0;
 }
 
+/** @brief 累积短读直到凑齐一帧后解析入队；队列满时丢当前样本并统计，不阻塞采样。 */
 static void *imu_thread(void *arg)
 {
     ocr_imu_reader_t *reader = arg;
@@ -831,6 +855,8 @@ static void *imu_thread(void *arg)
         }
         if (!(pfd.revents & POLLIN)) continue;
 
+        /* 字符设备 read 可以短读；have 保留本帧已到达字节，EAGAIN 后下轮继续。
+         * 只有 scan_bytes 收齐才解析，不能把半帧误当一组 accel/gyro/time。 */
         while (have < reader->scan_bytes &&
                atomic_load_explicit(&reader->running, memory_order_acquire)) {
             ssize_t count = read(reader->dev_fd, frame + have,
@@ -859,6 +885,8 @@ static void *imu_thread(void *arg)
             }
             ++reader->sample_count;
             push_result = ocr_ringbuffer_push(&reader->ring, &sample);
+            /* 队列满时只丢当前完整样本，不覆盖消费者尚未处理的旧样本。
+             * 下一个样本仍带真实时间戳，上层以时间差积分而不假设每步固定间隔。 */
             if (push_result == 1) {
                 ++reader->dropped_count;
             } else if (push_result != 0) {
@@ -910,6 +938,7 @@ int ocr_imu_reader_start(ocr_imu_reader_t *reader)
     return 0;
 }
 
+/** @brief 请求线程退出并 join，再关闭内核采样 buffer，避免销毁时仍有采样者。 */
 int ocr_imu_reader_stop(ocr_imu_reader_t *reader)
 {
     int result = 0;

@@ -45,6 +45,13 @@ endif()
 # 链接时删除未使用段
 add_link_options(-Wl,--gc-sections)
 
+# 交叉编译时 OCR_RGA_LIBRARY / OCR_RKNN_LIBRARY 是构建主机上的绝对路径, CMake
+# 默认会把它们所在目录写进 build-tree RPATH。产物是直接拷进 rootfs 部署的,
+# 这些路径在板卡上不存在, 反而会让 ld.so 找不到库。librga / librknnrt 由
+# rootfs 的 BR2_PACKAGE_LIBRGA / BR2_PACKAGE_RKNN_RUNTIME 装到标准库目录,
+# 交给动态链接器默认搜索即可。
+set(CMAKE_SKIP_BUILD_RPATH TRUE)
+
 # SDK/sysroot-specific include and library paths can be supplied explicitly.
 set(OCR_RGA_INCLUDE_DIR "" CACHE PATH "Directory containing im2d.h")
 set(OCR_RGA_LIBRARY "" CACHE FILEPATH "Path to target librga.so")
@@ -55,15 +62,33 @@ list(APPEND CMAKE_PREFIX_PATH ${CMAKE_SOURCE_DIR}/third_party)
 # 查找依赖包
 find_package(PkgConfig QUIET)
 
+# pkg-config 探测 + find_*() 回退的统一封装。两个坑必须一起绕开:
+#   1. pkg_check_modules() 的 <p>_LIBRARIES 只是库名 (链接时成 -lfoo), 库在非
+#      默认前缀下就找不到; <p>_LINK_LIBRARIES 给的是绝对路径, 优先用它。
+#   2. pkg-config 会剔除 -I/usr/include 这类系统默认包含路径, 所以命中时
+#      <p>_INCLUDE_DIRS 也可能是空的 (例如 libjpeg.pc 的 Cflags 只有
+#      -I${includedir})。而 find_path()/find_library() 遇到已定义的普通变量会
+#      直接跳过搜索 —— 即使它是空字符串 —— 因此回退必须写进独立的 cache 变量
+#      再赋回, 否则回退等于空操作。
+#
+# 用法: ocr_find_dependency(<PREFIX> <pc 名> <库名> <头文件> [find_path 额外参数])
+macro(ocr_find_dependency prefix pc_name lib_name header)
+    pkg_check_modules(${prefix} QUIET ${pc_name})
+    if(${prefix}_LINK_LIBRARIES)
+        set(${prefix}_LIBRARIES "${${prefix}_LINK_LIBRARIES}")
+    endif()
+    if(NOT ${prefix}_LIBRARIES)
+        find_library(OCR_${prefix}_LIBRARY ${lib_name})
+        set(${prefix}_LIBRARIES "${OCR_${prefix}_LIBRARY}")
+    endif()
+    if(NOT ${prefix}_INCLUDE_DIRS)
+        find_path(OCR_${prefix}_INCLUDE_DIR ${header} ${ARGN})
+        set(${prefix}_INCLUDE_DIRS "${OCR_${prefix}_INCLUDE_DIR}")
+    endif()
+endmacro()
+
 # libdrm
-pkg_check_modules(LIBDRM QUIET libdrm)
-if(NOT LIBDRM_FOUND)
-    find_library(LIBDRM_LIBRARIES drm)
-    find_path(LIBDRM_INCLUDE_DIRS xf86drm.h PATH_SUFFIXES libdrm)
-endif()
-if(NOT LIBDRM_INCLUDE_DIRS)
-    find_path(LIBDRM_INCLUDE_DIRS xf86drm.h PATH_SUFFIXES libdrm)
-endif()
+ocr_find_dependency(LIBDRM libdrm drm xf86drm.h PATH_SUFFIXES libdrm)
 
 # librga (Rockchip RGA)
 pkg_check_modules(LIBRGA QUIET librga)
@@ -87,31 +112,13 @@ if(NOT OCR_RKNN_INCLUDE_DIR)
 endif()
 
 # libjpeg
-pkg_check_modules(LIBJPEG QUIET libjpeg)
-if(NOT LIBJPEG_FOUND)
-    find_library(LIBJPEG_LIBRARIES jpeg)
-    find_path(LIBJPEG_INCLUDE_DIRS jpeglib.h)
-endif()
-if(NOT LIBJPEG_INCLUDE_DIRS)
-    find_path(LIBJPEG_INCLUDE_DIRS jpeglib.h)
-endif()
+ocr_find_dependency(LIBJPEG libjpeg jpeg jpeglib.h)
 
 # freetype2
-pkg_check_modules(FREETYPE QUIET freetype2)
-if(NOT FREETYPE_FOUND)
-    find_library(FREETYPE_LIBRARIES freetype)
-    find_path(FREETYPE_INCLUDE_DIRS ft2build.h PATH_SUFFIXES freetype2)
-endif()
+ocr_find_dependency(FREETYPE freetype2 freetype ft2build.h PATH_SUFFIXES freetype2)
 
 # cJSON
-pkg_check_modules(CJSON QUIET libcjson)
-if(NOT CJSON_FOUND)
-    find_library(CJSON_LIBRARIES cjson)
-    find_path(CJSON_INCLUDE_DIRS cjson/cJSON.h)
-endif()
-if(NOT CJSON_INCLUDE_DIRS)
-    find_path(CJSON_INCLUDE_DIRS cjson/cJSON.h)
-endif()
+ocr_find_dependency(CJSON libcjson cjson cjson/cJSON.h)
 
 if(NOT CJSON_LIBRARIES OR NOT CJSON_INCLUDE_DIRS)
     message(FATAL_ERROR "cJSON headers/library are required")

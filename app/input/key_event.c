@@ -1,6 +1,9 @@
 /**
  * @file key_event.c
  * @brief Input 子系统事件读取实现
+ *
+ * 发现支持 KEY_CAMERA 的 input 设备，在监听线程中读取按下/释放事件并调用业务回调。
+ * 自动发现只接受唯一匹配设备；停止时回收线程后再关闭 fd，回调在监听线程中同步执行。
  */
 #include "key_event.h"
 #include "log.h"
@@ -19,6 +22,7 @@
 #define BITS_PER_LONG_VALUE (sizeof(unsigned long) * 8U)
 #define BIT_WORD_COUNT(maximum) (((maximum) + BITS_PER_LONG_VALUE) / BITS_PER_LONG_VALUE)
 
+/** @brief 查询 input 按键能力位，确认设备确实支持拍照键。 */
 static int has_key_camera(int fd)
 {
     unsigned long bits[BIT_WORD_COUNT(KEY_MAX)];
@@ -45,6 +49,7 @@ static int is_event_name(const char *name)
     return 1;
 }
 
+/** @brief 遍历 event 节点并要求唯一 KEY_CAMERA 设备；多个匹配时交由配置显式选择。 */
 int ocr_key_event_find_device(char *dev_path, size_t dev_path_size)
 {
     DIR *directory;
@@ -125,6 +130,7 @@ static ocr_key_event_t code_to_event(uint16_t code)
     }
 }
 
+/** @brief poll/read input 事件并忽略自动重复，回调同步执行；异常时记录错误并退出线程。 */
 static void *key_thread(void *arg)
 {
     ocr_key_event_t_ctx *ke = (ocr_key_event_t_ctx *)arg;

@@ -1,3 +1,8 @@
+/**
+ * @file test_event_loop.c
+ * 以主机 eventfd 驱动生产事件循环，验证回调、注册变更及跨线程 stop 唤醒。
+ * 先确认线程进入运行状态再发事件，避免把调度竞态误判成业务失败。
+ */
 /* Unit tests for the production epoll event loop. */
 
 #include "event_loop.h"
@@ -22,9 +27,9 @@
     } while (0)
 
 typedef struct {
-    ocr_event_loop_t *loop;
-    atomic_int callbacks;
-    int run_result;
+    ocr_event_loop_t *loop; /**< 借用的受测事件循环，回调通过它请求停止；主测试负责销毁。 */
+    atomic_int callbacks; /**< 原子记录事件回调次数，供主线程在 join 前后判断是否实际收到事件。 */
+    int run_result; /**< 运行线程写入的 event_loop_run 返回码，主线程 join 后检查。 */
 } loop_fixture_t;
 
 static void event_callback(int fd, uint32_t events, void *user)

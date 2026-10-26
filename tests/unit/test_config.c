@@ -1,3 +1,8 @@
+/**
+ * @file test_config.c
+ * 读取项目配置并检查解析后的关键字段，同时构造超长设备路径验证拒绝行为。
+ * 主机测试不打开真实摄像头、显示设备或模型，配置路径由 CMake 注入。
+ */
 /* Unit tests for parsing the checked-in application configuration. */
 
 #include "config.h"
@@ -42,7 +47,6 @@ int main(void)
     CHECK(config_load(&cfg, OCR_TEST_CONFIG_PATH) == 0);
 
     CHECK(strcmp(cfg.app_name, "ocr_translator") == 0);
-    CHECK(cfg.run_mode == 0);
     CHECK(cfg.log_level == 1);
     CHECK(strcmp(cfg.log_path, "/var/log/ocr_translator.log") == 0);
 

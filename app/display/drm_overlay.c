@@ -1,6 +1,9 @@
 /**
  * @file drm_overlay.c
  * @brief DRM dumb buffer 上的 FreeType ARGB 文字叠加
+ *
+ * 文字叠加使用两块 ARGB8888 DRM dumb buffer：CPU 绘制后台缓冲，再提交 overlay plane。
+ * 前后缓冲按提交和 vblank 时序交替使用；PRIME fd 仅供可选共享，扫描输出直接使用 framebuffer。
  */
 #include "drm_overlay.h"
 #include "log.h"
@@ -9,6 +12,7 @@
 #include <drm_fourcc.h>
 #include <drm_mode.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -16,6 +20,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+/** @brief 创建可供 CPU 绘制的 ARGB 缓冲和 framebuffer，PRIME 导出失败不影响本地显示。 */
 static int create_dumb_overlay(ocr_drm_overlay_t *overlay, int index)
 {
     struct drm_mode_create_dumb create_req;
@@ -96,29 +101,12 @@ int ocr_overlay_init(ocr_drm_overlay_t *overlay, ocr_drm_device_t *dev,
     overlay->resource_active = 1;
     overlay->dev = dev;
     overlay->planes = planes;
-    overlay->font_size = font_size;
     overlay->width = width;
     overlay->height = height;
 
-    FT_Error ft_err = FT_Init_FreeType(&overlay->ft_lib);
-    if (ft_err) {
-        LOG_E("FT_Init_FreeType 失败: %d", ft_err);
+    if (ocr_text_renderer_init(&overlay->text, font_path, font_size) != 0) {
         ocr_overlay_destroy(overlay);
         return -3;
-    }
-
-    ft_err = FT_New_Face(overlay->ft_lib, font_path, 0, &overlay->ft_face);
-    if (ft_err) {
-        LOG_E("FT_New_Face 加载字体 %s 失败: %d", font_path, ft_err);
-        ocr_overlay_destroy(overlay);
-        return -4;
-    }
-
-    ft_err = FT_Set_Pixel_Sizes(overlay->ft_face, 0, (FT_UInt)font_size);
-    if (ft_err) {
-        LOG_E("FT_Set_Pixel_Sizes 失败: %d", ft_err);
-        ocr_overlay_destroy(overlay);
-        return -5;
     }
 
     for (int i = 0; i < 2; ++i) {
@@ -136,183 +124,20 @@ int ocr_overlay_init(ocr_drm_overlay_t *overlay, ocr_drm_device_t *dev,
     return 0;
 }
 
-static int is_continuation(unsigned char c)
-{
-    return (c & 0xC0U) == 0x80U;
-}
-
-/* 严格 UTF-8 解码：支持 1~4 字节，拒绝过长编码、代理项和 >U+10FFFF。 */
-static uint32_t utf8_next(const unsigned char **cursor)
-{
-    const unsigned char *p = *cursor;
-    uint32_t cp;
-
-    if (p[0] < 0x80U) {
-        *cursor = p + 1;
-        return p[0];
-    }
-    if (p[0] >= 0xC2U && p[0] <= 0xDFU && p[1] != 0 && is_continuation(p[1])) {
-        cp = ((uint32_t)(p[0] & 0x1FU) << 6) | (uint32_t)(p[1] & 0x3FU);
-        *cursor = p + 2;
-        return cp;
-    }
-    if (p[0] >= 0xE0U && p[0] <= 0xEFU &&
-        p[1] != 0 && p[2] != 0 && is_continuation(p[1]) && is_continuation(p[2]) &&
-        !(p[0] == 0xE0U && p[1] < 0xA0U) &&
-        !(p[0] == 0xEDU && p[1] >= 0xA0U)) {
-        cp = ((uint32_t)(p[0] & 0x0FU) << 12) |
-             ((uint32_t)(p[1] & 0x3FU) << 6) |
-             (uint32_t)(p[2] & 0x3FU);
-        *cursor = p + 3;
-        return cp;
-    }
-    if (p[0] >= 0xF0U && p[0] <= 0xF4U &&
-        p[1] != 0 && p[2] != 0 && p[3] != 0 &&
-        is_continuation(p[1]) && is_continuation(p[2]) && is_continuation(p[3]) &&
-        !(p[0] == 0xF0U && p[1] < 0x90U) &&
-        !(p[0] == 0xF4U && p[1] >= 0x90U)) {
-        cp = ((uint32_t)(p[0] & 0x07U) << 18) |
-             ((uint32_t)(p[1] & 0x3FU) << 12) |
-             ((uint32_t)(p[2] & 0x3FU) << 6) |
-             (uint32_t)(p[3] & 0x3FU);
-        *cursor = p + 4;
-        return cp;
-    }
-
-    *cursor = p + 1;
-    return 0xFFFDU;
-}
-
-static uint8_t glyph_coverage(const FT_Bitmap *bitmap,
-                              unsigned int row, unsigned int col)
-{
-    int pitch = bitmap->pitch;
-    const uint8_t *line;
-    if (pitch >= 0) {
-        line = bitmap->buffer + (size_t)row * (size_t)pitch;
-    } else {
-        line = bitmap->buffer +
-               (size_t)(bitmap->rows - 1U - row) * (size_t)(-pitch);
-    }
-
-    if (bitmap->pixel_mode == FT_PIXEL_MODE_MONO) {
-        return (line[col >> 3] & (0x80U >> (col & 7U))) ? 255U : 0U;
-    }
-    if (bitmap->pixel_mode == FT_PIXEL_MODE_GRAY) {
-        uint32_t value = line[col];
-        if (bitmap->num_grays > 1 && bitmap->num_grays != 256) {
-            value = value * 255U / (bitmap->num_grays - 1U);
-        }
-        return (uint8_t)value;
-    }
-    if (bitmap->pixel_mode == FT_PIXEL_MODE_BGRA) {
-        return line[col * 4U + 3U];
-    }
-    return 0;
-}
-
-/*
- * buffer 使用 premultiplied ARGB，与 DRM 的 Pre-multiplied blend mode 对齐。
- * color 参数仍是调用方熟悉的 straight 0xAARRGGBB。
- */
-static void blend_pixel(uint32_t *dst, uint32_t color, uint8_t coverage)
-{
-    uint32_t ca = (color >> 24) & 0xFFU;
-    uint32_t cr = (color >> 16) & 0xFFU;
-    uint32_t cg = (color >> 8) & 0xFFU;
-    uint32_t cb = color & 0xFFU;
-    uint32_t sa = ca * coverage / 255U;
-    if (sa == 0) return;
-
-    uint32_t old = *dst;
-    uint32_t da = (old >> 24) & 0xFFU;
-    uint32_t dr = (old >> 16) & 0xFFU;
-    uint32_t dg = (old >> 8) & 0xFFU;
-    uint32_t db = old & 0xFFU;
-    uint32_t inv = 255U - sa;
-
-    uint32_t out_a = sa + da * inv / 255U;
-    uint32_t out_r = cr * sa / 255U + dr * inv / 255U;
-    uint32_t out_g = cg * sa / 255U + dg * inv / 255U;
-    uint32_t out_b = cb * sa / 255U + db * inv / 255U;
-
-    *dst = (out_a << 24) | (out_r << 16) | (out_g << 8) | out_b;
-}
-
+/** @brief 把文字绘制到后台缓冲，逐行寻址使用 DRM 返回的 pitch。 */
 int ocr_overlay_render_text(ocr_drm_overlay_t *overlay, const char *text,
                             int x, int y, uint32_t color)
 {
     int draw;
-    if (!overlay || !overlay->initialized || !text || !overlay->ft_face ||
+    if (!overlay || !overlay->initialized || !text ||
         overlay->draw_index < 0 || overlay->draw_index > 1) {
         return -1;
     }
     draw = overlay->draw_index;
     if (!overlay->pixels[draw]) return -1;
-
-    int pen_x = x;
-    int pen_y = y + overlay->font_size;
-    const int origin_x = x;
-    const int line_step = overlay->font_size + overlay->font_size / 4;
-    FT_UInt previous = 0;
-
-    const unsigned char *cursor = (const unsigned char *)text;
-    while (*cursor) {
-        uint32_t codepoint = utf8_next(&cursor);
-        if (codepoint == '\r') continue;
-        if (codepoint == '\n') {
-            pen_x = origin_x;
-            pen_y += line_step;
-            previous = 0;
-            continue;
-        }
-        if (codepoint == '\t') {
-            pen_x += overlay->font_size * 2;
-            previous = 0;
-            continue;
-        }
-
-        FT_UInt glyph_index = FT_Get_Char_Index(overlay->ft_face, codepoint);
-        if (previous && glyph_index && FT_HAS_KERNING(overlay->ft_face)) {
-            FT_Vector kerning;
-            if (FT_Get_Kerning(overlay->ft_face, previous, glyph_index,
-                               FT_KERNING_DEFAULT, &kerning) == 0) {
-                pen_x += (int)(kerning.x >> 6);
-            }
-        }
-
-        FT_Error ft_err = FT_Load_Glyph(overlay->ft_face, glyph_index, FT_LOAD_DEFAULT);
-        if (ft_err || FT_Render_Glyph(overlay->ft_face->glyph, FT_RENDER_MODE_NORMAL) != 0) {
-            previous = 0;
-            continue;
-        }
-
-        FT_GlyphSlot slot = overlay->ft_face->glyph;
-        const FT_Bitmap *bitmap = &slot->bitmap;
-        for (unsigned int row = 0; row < bitmap->rows; ++row) {
-            for (unsigned int col = 0; col < bitmap->width; ++col) {
-                int px = pen_x + slot->bitmap_left + (int)col;
-                int py = pen_y - slot->bitmap_top + (int)row;
-                if (px < 0 || py < 0 ||
-                    (uint32_t)px >= overlay->width ||
-                    (uint32_t)py >= overlay->height) {
-                    continue;
-                }
-
-                uint8_t coverage = glyph_coverage(bitmap, row, col);
-                uint32_t *dst = (uint32_t *)
-                    ((uint8_t *)overlay->pixels[draw] +
-                     (size_t)py * overlay->pitch[draw] +
-                     (size_t)px * 4U);
-                blend_pixel(dst, color, coverage);
-            }
-        }
-
-        pen_x += (int)(slot->advance.x >> 6);
-        pen_y += (int)(slot->advance.y >> 6);
-        previous = glyph_index;
-    }
-    return 0;
+    return ocr_text_renderer_draw(&overlay->text, overlay->pixels[draw],
+                                  overlay->width, overlay->height,
+                                  overlay->pitch[draw], text, x, y, color);
 }
 
 int ocr_overlay_clear(ocr_drm_overlay_t *overlay)
@@ -326,6 +151,7 @@ int ocr_overlay_clear(ocr_drm_overlay_t *overlay)
     return 0;
 }
 
+/** @brief 等待选定 CRTC 的下一次 vblank，供前后缓冲交换使用。 */
 static int wait_overlay_vblank(ocr_drm_overlay_t *overlay)
 {
     drmVBlank vblank;
@@ -352,6 +178,7 @@ static int wait_overlay_vblank(ocr_drm_overlay_t *overlay)
     }
 }
 
+/** @brief 提交后台文字层并按 vblank 时序交换绘制缓冲，避免立即覆写前台。 */
 int ocr_overlay_commit(ocr_drm_overlay_t *overlay)
 {
     if (!overlay || !overlay->initialized || !overlay->planes ||
@@ -361,7 +188,9 @@ int ocr_overlay_commit(ocr_drm_overlay_t *overlay)
     }
 
     int next = overlay->draw_index;
-    /* 只提交非 scanout buffer；下一帧再绘制刚刚退役的另一块 buffer。 */
+    /* 只提交非 scanout buffer；下一帧再绘制刚刚退役的另一块 buffer。
+     * CPU 内存屏障约束写入排序，不等同于 DMA_BUF_IOCTL_SYNC；本路径通过
+     * DRM dumb buffer 映射绘制，映射的缓存属性由 DRM 驱动决定。 */
     __sync_synchronize();
     int ret = ocr_drm_plane_set_fb_ex(
         overlay->planes, overlay->planes->overlay, overlay->fb_id[next],
@@ -429,14 +258,7 @@ void ocr_overlay_destroy(ocr_drm_overlay_t *overlay)
         }
     }
     if (cleanup_failed) return;
-    if (overlay->ft_face) {
-        FT_Done_Face(overlay->ft_face);
-        overlay->ft_face = NULL;
-    }
-    if (overlay->ft_lib) {
-        FT_Done_FreeType(overlay->ft_lib);
-        overlay->ft_lib = NULL;
-    }
+    ocr_text_renderer_destroy(&overlay->text);
 
     memset(overlay, 0, sizeof(*overlay));
     overlay->dmabuf_fd[0] = -1;

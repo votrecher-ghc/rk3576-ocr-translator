@@ -3,6 +3,9 @@
 /**
  * @file archiver.h
  * @brief 归档管理：按时间戳创建目录，保存 image.jpg/result.json/result.txt
+ *
+ * 拍照归档：创建日期/会话目录，保存原图 JPEG、识别/翻译文本以及文本框 JSON。
+ * 目录路径保存在归档条目中，后续写入函数复用该条目；错误由调用方决定如何恢复。
  */
 
 #include <stdint.h>
@@ -13,10 +16,10 @@
 
 /** 与 AI 模块解耦的四点文本框序列化格式。 */
 typedef struct {
-    float x[4];
-    float y[4];
-    float score;
-    int   valid;
+    float x[4]; /**< 归档图像中四个文本框顶点的横坐标，像素，与检测框同顺序。 */
+    float y[4]; /**< 归档图像中四个顶点的纵坐标，像素，与同索引 x 配对。 */
+    float score; /**< 检测框置信度，写入 result.json；不是识别字符的概率。 */
+    int   valid; /**< 文本框有效标记，随检测结果复制到归档元数据。 */
 } ocr_archive_box_t;
 
 /** 单次归档结果 */
@@ -25,15 +28,15 @@ typedef struct {
     char     image_path[ARCHIVE_PATH_LEN];/* image.jpg 路径 */
     char     json_path[ARCHIVE_PATH_LEN]; /* result.json 路径 */
     char     txt_path[ARCHIVE_PATH_LEN];  /* result.txt 路径 */
-    uint64_t timestamp;                   /* 归档时间戳 */
-    char     src_lang[16];                /* 源语言 */
-    char     tgt_lang[16];                /* 目标语言 */
+    uint64_t timestamp; /**< 创建本次归档时的 CLOCK_REALTIME 毫秒值，不能直接与单调采集纳秒比较。 */
+    char     src_lang[16]; /**< 本次归档记录的源语言代码，含 NUL，例如 en；不用于在此处选择模型。 */
+    char     tgt_lang[16]; /**< 本次归档记录的目标语言代码，含 NUL，例如 zh。 */
 } ocr_archive_entry_t;
 
 /** 归档器上下文 */
 typedef struct {
     char root_dir[ARCHIVE_PATH_LEN]; /* 归档根目录 */
-    int  count;                      /* 累计归档数 */
+    int  count; /**< 本进程本归档器累计创建次数，参与生成唯一目录后缀；不扫描统计磁盘既有归档。 */
 } ocr_archiver_t;
 
 /**

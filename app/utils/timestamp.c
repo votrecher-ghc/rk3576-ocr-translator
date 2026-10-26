@@ -1,6 +1,9 @@
 /**
  * @file timestamp.c
  * @brief 时间戳工具实现
+ *
+ * 使用 CLOCK_MONOTONIC 生成耗时统计时间戳，避免系统日期校准导致时间倒退。
+ * 接口名称区分毫秒、微秒和纳秒；休眠遇到信号中断时继续等待剩余时长。
  */
 #include "timestamp.h"
 

@@ -1,6 +1,9 @@
 /**
  * @file ocr_postproc.c
  * @brief Dependency-free DB connected-component post-processing.
+ *
+ * 检测后处理：阈值二值化 -> 搜索连通域 -> 按平均概率筛选并扩张边框 -> 阅读顺序排序。
+ * 工作区版本复用调用方内存；便捷版本临时分配工作区。输出使用有容量上限的文本框数组。
  */
 #include "ocr_postproc.h"
 
@@ -32,6 +35,7 @@ static float clamp_coord(float value, float maximum)
     return fminf(maximum, fmaxf(0.0f, value));
 }
 
+/** @brief 输出数组满时比较置信度，保留更可靠的文本框而不是越界写入。 */
 static void keep_best_box(ocr_text_box_list_t *out,
                           const ocr_text_box_t *candidate)
 {
@@ -49,6 +53,7 @@ static void keep_best_box(ocr_text_box_list_t *out,
     }
 }
 
+/** @brief 洪泛搜索二值图连通域，计算区域概率和包围框，再按阈值筛选并扩张。 */
 static int extract_components(uint8_t *binary, const float *prob_map,
                               int width, int height, float box_thresh,
                               float unclip_ratio, size_t *queue,
@@ -68,6 +73,8 @@ static int extract_components(uint8_t *binary, const float *prob_map,
         double sum_x = 0.0, sum_y = 0.0;
         double sum_xx = 0.0, sum_xy = 0.0, sum_yy = 0.0;
 
+        /* 入队时就把 binary 标记清零，而非出队才清：一个像素最多入队一次，
+         * 因此长度为总像素数的工作队列足够容纳任一连通域，不会被重复邻接项挤满。 */
         binary[seed] = 0;
         queue[tail++] = seed;
         while (head < tail) {
@@ -94,10 +101,14 @@ static int extract_components(uint8_t *binary, const float *prob_map,
             }
         }
 
+        /* 单像素或过小噪声不当作文本；置信度取连通域内全部概率的均值，
+         * 与“像素是否入选”的二值阈值是两层不同的筛选。 */
         if (component_pixels < 3) continue;
         float score = (float)(score_sum / (double)component_pixels);
         if (!isfinite(score) || score < box_thresh) continue;
 
+        /* 从像素分布的协方差估计文字主方向，再沿主方向求包围框。
+         * 这样倾斜文字得到的是旋转四边形，而不是仅有水平/垂直边的外接框。 */
         double mean_x = sum_x / (double)component_pixels;
         double mean_y = sum_y / (double)component_pixels;
         double cov_xx = sum_xx / (double)component_pixels - mean_x * mean_x;
@@ -122,12 +133,14 @@ static int extract_components(uint8_t *binary, const float *prob_map,
             if (pv < min_v) min_v = pv;
             if (pv > max_v) max_v = pv;
         }
-        /* Pixel centers span one pixel less than the component's outer edge. */
+        /* 上面统计像素中心，这里向外补半个像素，恢复连通域的外边缘。 */
         min_u -= 0.5f; max_u += 0.5f;
         min_v -= 0.5f; max_v += 0.5f;
         float box_w = max_u - min_u;
         float box_h = max_v - min_v;
         float perimeter = 2.0f * (box_w + box_h);
+        /* 根据面积/周长估计 unclip 扩张距离，在主轴坐标上同时向四侧外扩。
+         * 这是当前包围框扩张实现，unclip_ratio 不是直接把宽高乘该比例。 */
         float distance = perimeter > 0.0f
                        ? (box_w * box_h * unclip_ratio) / perimeter
                        : 0.0f;
@@ -179,6 +192,7 @@ static void insertion_sort_x(ocr_text_box_t *boxes, int begin, int end)
     }
 }
 
+/** @brief 先分行，再将同一行按横坐标排序，得到近似从上到下、从左到右的阅读顺序。 */
 int ocr_sort_boxes(ocr_text_box_list_t *list)
 {
     if (!list || list->count < 0 || list->count > OCR_MAX_TEXT_BOXES) {
@@ -233,6 +247,7 @@ static int validate_request(const float *prob_map, int width, int height,
     return 0;
 }
 
+/** @brief 使用外部工作区完成后处理，调用者保证容量足够并独占该工作区。 */
 int ocr_db_postprocess_with_workspace(
     const float *prob_map, int width, int height,
     float thresh, float box_thresh, float unclip_ratio,
@@ -258,6 +273,7 @@ int ocr_db_postprocess_with_workspace(
     return ocr_sort_boxes(out);
 }
 
+/** @brief 为单次调用分配临时工作区；实时逐帧处理优先使用工作区版本。 */
 int ocr_db_postprocess(const float *prob_map, int width, int height,
                        float thresh, float box_thresh, float unclip_ratio,
                        ocr_text_box_list_t *out)

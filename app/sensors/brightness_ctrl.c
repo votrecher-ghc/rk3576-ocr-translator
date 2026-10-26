@@ -1,6 +1,9 @@
 /**
  * @file brightness_ctrl.c
  * @brief 亮度调节实现
+ *
+ * 把环境光 lux 映射为背光等级，结合回差和低通滤波减少亮度抖动。
+ * 通过 backlight sysfs 写 brightness，实际最大值优先读取 max_brightness，写入失败时更新路径恢复旧值。
  */
 #include "brightness_ctrl.h"
 #include "math_utils.h"
@@ -74,6 +77,7 @@ int ocr_brightness_init(ocr_brightness_t *ctrl, const char *sysfs_path)
     return 0;
 }
 
+/** @brief 先对目标值施加回差，再平滑逼近；整数舍入停滞时至少前进一步。 */
 int ocr_brightness_update(ocr_brightness_t *ctrl, int lux)
 {
     if (!ctrl || lux < 0) return -1;

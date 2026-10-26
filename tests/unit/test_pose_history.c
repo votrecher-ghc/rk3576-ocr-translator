@@ -1,3 +1,8 @@
+/**
+ * @file test_pose_history.c
+ * 验证递增时间戳、姿态插值和范围外端点行为。
+ * 查询时间对应图像时刻，插值结果应是单位四元数并沿最短旋转方向变化。
+ */
 #include "pose_history.h"
 
 #include <assert.h>

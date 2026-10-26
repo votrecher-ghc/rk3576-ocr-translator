@@ -1,3 +1,8 @@
+/**
+ * @file iio_discovery.c
+ * 根据 IIO name 属性寻找设备，同时返回 sysfs 路径和 /dev/iio:deviceN 节点。
+ * 设备编号受探测顺序影响，不能写死；自动发现只接受唯一匹配，多个同名设备需要显式配置。
+ */
 #include "iio_discovery.h"
 
 #include <ctype.h>
@@ -42,6 +47,7 @@ static int read_iio_name(const char *entry, char *name, size_t name_size)
     return name[0] != '\0' ? 0 : -1;
 }
 
+/** @brief 按 name 精确匹配唯一 IIO 设备，同时构造 sysfs 和字符设备路径。 */
 int ocr_iio_find_device(const char *iio_name,
                         char *sysfs_path, size_t sysfs_size,
                         char *dev_path, size_t dev_size)

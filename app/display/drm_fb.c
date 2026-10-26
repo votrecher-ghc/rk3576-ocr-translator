@@ -1,6 +1,9 @@
 /**
  * @file drm_fb.c
  * @brief DMA-BUF 导入 DRM framebuffer 与同步 page flip
+ *
+ * 把 DMA-BUF 导入为 GEM handle，并根据像素格式、stride 和 offset 创建 framebuffer。
+ * 导入不复制像素，源 fd 只是借用；翻页接口等待新帧切换完成，供调用方安全释放上一帧。
  */
 #include "drm_fb.h"
 #include "log.h"
@@ -43,6 +46,7 @@ static uint64_t plane_end(uint32_t offset, uint32_t pitch,
  * 生成并校验 linear buffer 布局。本模块没有 modifier 参数，因此明确只支持
  * 线性布局；驱动返回的 bytesperline 应由调用方通过 pitches 传入。
  */
+/** @brief 推导并验证 DRM 平面布局及最小缓冲大小，避免内核扫描超出 DMA-BUF 边界。 */
 static int build_layout(const ocr_buffer_t *buf,
                         const uint32_t input_pitches[4],
                         const uint32_t input_offsets[4],
@@ -103,6 +107,8 @@ static int build_layout(const ocr_buffer_t *buf,
             return -3;
     }
 
+    /* DRM pitch 的单位是字节，不能传 RGA 的像素 wstride。
+     * 没给 input_pitches 才回退到紧密布局；带 padding 的图像必须提供实际值。 */
     for (uint32_t i = 0; i < *plane_count; ++i) {
         pitches[i] = input_pitches ? input_pitches[i] : row_bytes[i];
         if (pitches[i] < row_bytes[i]) return -4;
@@ -123,6 +129,8 @@ static int build_layout(const ocr_buffer_t *buf,
         /* 线性单 DMA-BUF 的第二平面不能与第一平面重叠。 */
         if ((uint64_t)offsets[1] < end0) return -6;
     }
+    /* 同一 fd 包含所有逻辑平面，所需空间是最远平面的末端，而不是简单相加。
+     * size=0 的旧接口对象无法在这里验证分配容量，正常池对象应始终提供真实 size。 */
     *required_size = end0 > end1 ? end0 : end1;
     if (buf->size != 0 && *required_size > buf->size) return -7;
     return 0;
@@ -137,6 +145,7 @@ static void close_gem_handle(ocr_drm_device_t *dev, uint32_t handle)
     (void)drmIoctl(dev->fd, DRM_IOCTL_GEM_CLOSE, &close_arg);
 }
 
+/** @brief 借用源 fd 创建 GEM/FB 对象，NV12 的两个逻辑平面共用同一 GEM handle。 */
 int ocr_drm_fb_create_with_layout(ocr_drm_device_t *dev,
                                   const ocr_buffer_t *buf,
                                   const uint32_t input_pitches[4],
@@ -161,6 +170,8 @@ int ocr_drm_fb_create_with_layout(ocr_drm_device_t *dev,
         return -3;
     }
 
+    /* fd 是进程可共享的 DMA-BUF 引用；handle 是当前 DRM 文件上下文内的 GEM
+     * 标识，两者不是同一种句柄。导入建立内核引用/设备映射，不做 CPU 像素复制。 */
     ret = drmPrimeFDToHandle(dev->fd, buf->fd, &fb->handle);
     if (ret != 0) {
         LOG_E("drmPrimeFDToHandle fd=%d 失败: %s", buf->fd, strerror(errno));
@@ -173,6 +184,8 @@ int ocr_drm_fb_create_with_layout(ocr_drm_device_t *dev,
         fb->handles[i] = fb->handle;
     }
 
+    /* AddFB2 给已有 GEM 内存附加图像解释方式，返回 framebuffer ID。
+     * 这个调用还没有把图像送上屏幕；真正的扫描绑定在 modeset/pageflip 中。 */
     ret = drmModeAddFB2(dev->fd, buf->width, buf->height, fourcc,
                         fb->handles, fb->pitches, fb->offsets,
                         &fb->fb_id, 0);
@@ -201,6 +214,7 @@ int ocr_drm_fb_create(ocr_drm_device_t *dev, const ocr_buffer_t *buf,
     return ocr_drm_fb_create_with_layout(dev, buf, NULL, NULL, fb);
 }
 
+/** @brief 移除 framebuffer 并关闭本模块导入的 GEM handle；不关闭源 DMA-BUF fd。 */
 int ocr_drm_fb_destroy(ocr_drm_device_t *dev, ocr_drm_fb_t *fb)
 {
     if (!fb) return -1;
@@ -217,6 +231,8 @@ int ocr_drm_fb_destroy(ocr_drm_device_t *dev, ocr_drm_fb_t *fb)
             return -2;
         }
     }
+    /* 删除的是 DRM framebuffer 和导入句柄，源 DMA-BUF fd 归池所有。
+     * 只有上层先让显示离开此图像，才能释放对应的应用引用并允许池复用。 */
     if (fb->handle != 0) {
         close_gem_handle(dev, fb->handle);
     }
@@ -225,9 +241,9 @@ int ocr_drm_fb_destroy(ocr_drm_device_t *dev, ocr_drm_fb_t *fb)
 }
 
 typedef struct {
-    int done;
-    uint32_t tv_sec;
-    uint32_t tv_usec;
+    int done; /**< 解析到本次翻页完成事件时置 1；由 drmHandleEvent 内回调更新，同线程等待读取。 */
+    uint32_t tv_sec; /**< DRM 翻页事件携带的时间戳秒部分，供上层回调使用。 */
+    uint32_t tv_usec; /**< 同一翻页时间戳的微秒小数部分，不能直接当纳秒相加。 */
 } pageflip_wait_t;
 
 static void pageflip_complete(int fd, unsigned int sequence,
@@ -253,6 +269,7 @@ static int crtc_is_scanning_fb(const ocr_drm_device_t *dev, uint32_t fb_id)
     return matches;
 }
 
+/** @brief 等待 DRM 翻页完成事件；这意味着新帧已接替旧帧，并非新帧已不再被扫描。 */
 static int wait_pageflip_event(ocr_drm_device_t *dev, uint32_t fb_id,
                                pageflip_wait_t *wait)
 {
@@ -261,15 +278,21 @@ static int wait_pageflip_event(ocr_drm_device_t *dev, uint32_t fb_id,
 
     memset(&event_ctx, 0, sizeof(event_ctx));
     event_ctx.version = DRM_EVENT_CONTEXT_VERSION;
+    /* 回调不由内核直接跳进用户代码，而是在 drmHandleEvent 解析 DRM 事件时调用。
+     * drmModePageFlip 提交时传入的 user_data 会随事件回到 pageflip_complete。 */
     event_ctx.page_flip_handler = pageflip_complete;
     memset(&pfd, 0, sizeof(pfd));
     pfd.fd = dev->fd;
     pfd.events = POLLIN;
 
     while (!wait->done) {
+        /* 此处 poll 的是 DRM 设备 fd，不是图像的 DMA-BUF fd。
+         * -1 表示无限等待：当前代码没有翻页超时，停止线程需等本次等待返回。 */
         int ret = poll(&pfd, 1, -1);
         if (ret < 0) {
             if (errno == EINTR) continue;
+            /* 事件读取异常时再查询实际 CRTC：若新 fb 已成为当前扫描源，可确认
+             * 已切换；否则不能把事件异常误判成成功，返回失败给上层。 */
             if (crtc_is_scanning_fb(dev, fb_id)) {
                 wait->done = 1;
                 break;
@@ -288,6 +311,8 @@ static int wait_pageflip_event(ocr_drm_device_t *dev, uint32_t fb_id,
         }
         if (!(pfd.revents & POLLIN)) continue;
 
+        /* POLLIN 仅说明存在 DRM 事件；解析并执行本次 flip 的回调后 done 才置 1。
+         * 其他事件不代表这次翻页完成，因此外层继续检查 wait->done。 */
         ret = drmHandleEvent(dev->fd, &event_ctx);
         if (ret != 0) {
             if (errno == EINTR) continue;
@@ -303,6 +328,7 @@ static int wait_pageflip_event(ocr_drm_device_t *dev, uint32_t fb_id,
     return 0;
 }
 
+/** @brief 首帧同步 modeset，后续提交翻页并等待完成后返回，供上层释放旧帧。 */
 int ocr_drm_fb_pageflip(ocr_drm_device_t *dev, ocr_drm_fb_t *fb,
                         void (*vblank_cb)(int, uint32_t, uint32_t, void *),
                         void *user_data)
@@ -322,10 +348,13 @@ int ocr_drm_fb_pageflip(ocr_drm_device_t *dev, ocr_drm_fb_t *fb,
         return ret;
     }
 
+    /* wait 放在当前函数栈上，正常路径必须等待其完成事件被消费后才能返回，
+     * 否则提交给内核事件的 &wait 会失去有效生命周期。 */
     pageflip_wait_t wait;
     memset(&wait, 0, sizeof(wait));
 
-    /* 只在内核明确报告本次 flip 完成后，调用方才可归还上一帧。 */
+    /* 提交成功仅表示请求被接收，不表示屏幕已切换；EVENT 要求内核返回完成通知。
+     * 切换点到来后旧帧才退出扫描，新帧成为当前扫描源，还需继续保持引用。 */
     if (drmModePageFlip(dev->fd, dev->crtc_id, fb->fb_id,
                         DRM_MODE_PAGE_FLIP_EVENT, &wait) != 0) {
         LOG_E("drmModePageFlip crtc=%u fb=%u 失败: %s",

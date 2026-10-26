@@ -1,6 +1,9 @@
 /**
  * @file archiver.c
  * @brief 归档管理实现
+ *
+ * 拍照归档：创建日期/会话目录，保存原图 JPEG、识别/翻译文本以及文本框 JSON。
+ * 目录路径保存在归档条目中，后续写入函数复用该条目；错误由调用方决定如何恢复。
  */
 #include "archiver.h"
 #include "log.h"
@@ -16,6 +19,7 @@
 #include <cjson/cJSON.h>
 
 /* 递归创建目录 */
+/** @brief 逐级创建目录，并验证已经存在的路径确实是目录。 */
 static int mkdir_p(const char *path)
 {
     char tmp[ARCHIVE_PATH_LEN];
@@ -61,6 +65,7 @@ int ocr_archiver_init(ocr_archiver_t *arch, const char *root_dir)
     return 0;
 }
 
+/** @brief 为一次拍照建立独立归档目录，并生成图像、文本和 JSON 的目标路径。 */
 int ocr_archiver_create(ocr_archiver_t *arch, ocr_archive_entry_t *entry)
 {
     if (!arch || !entry) return -1;
@@ -113,6 +118,7 @@ int ocr_archiver_save_text(ocr_archive_entry_t *entry, const char *text, const c
     return ret;
 }
 
+/** @brief 把文本框坐标、原文和译文交给 cJSON 序列化，避免手工拼接造成转义错误。 */
 int ocr_archiver_save_json(ocr_archive_entry_t *entry, const ocr_archive_box_t *boxes,
                            char **texts, char **trans, int count)
 {

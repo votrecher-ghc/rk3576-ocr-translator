@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# 翻译模型必须导出为静态序列：encoder 读取 token，decoder 读取目标前缀和 encoder 状态。
+# 本脚本验证 ONNX/词表约定、转换模型并生成 manifest，运行时据此拒绝不匹配资产。
 """Convert a static encoder/decoder translation pair to RKNN.
 
 The runtime intentionally accepts only this contract:

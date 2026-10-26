@@ -1,6 +1,9 @@
 /**
  * @file rknn_runtime.c
  * @brief Ownership-safe RKNN runtime wrapper.
+ *
+ * RKNN 运行时封装：加载模型和张量属性，设置普通内存输入，运行推理并管理输出生命周期。
+ * 输出指针由上下文持有，下次推理或销毁前有效；DMA-BUF 导入因缺少原生张量布局约定而返回不支持。
  */
 #include "rknn_runtime.h"
 #include "log.h"
@@ -35,6 +38,7 @@ static int tensor_type_size(rknn_tensor_type type)
     }
 }
 
+/** @brief 复制模型张量形状、类型和量化属性，后续输入校验以这些属性为准。 */
 static void copy_tensor_attr(ocr_rknn_tensor_t *dst,
                              const rknn_tensor_attr *src)
 {
@@ -67,6 +71,7 @@ static void copy_tensor_attr(ocr_rknn_tensor_t *dst,
     dst->name[name_len] = '\0';
 }
 
+/** @brief 归还 RKNN 持有的上次输出，并清空本地输出指针，防止重复释放。 */
 static void release_outputs(ocr_rknn_t *rknn)
 {
     rknn_output outputs[RKNN_MAX_IO];
@@ -92,6 +97,7 @@ static void release_outputs(ocr_rknn_t *rknn)
     rknn->outputs_acquired = 0;
 }
 
+/** @brief 读取模型、创建上下文并查询输入输出属性；任何步骤失败都撤销已分配资源。 */
 int ocr_rknn_load(ocr_rknn_t *rknn, const char *model_path)
 {
     struct stat st;
@@ -139,6 +145,8 @@ int ocr_rknn_load(ocr_rknn_t *rknn, const char *model_path)
     }
     fp = NULL;
 
+    /* flags=0 走普通上下文初始化；model 是临时文件内容，初始化结束立即释放。
+     * 后续运行依赖 rknn_ctx，不再依赖这份加载文件用的堆缓冲。 */
     ret = rknn_init(&rknn->rknn_ctx, model, (uint32_t)st.st_size, 0, NULL);
     free(model);
     model = NULL;
@@ -162,6 +170,8 @@ int ocr_rknn_load(ocr_rknn_t *rknn, const char *model_path)
     rknn->input_num = (int)io_num.n_input;
     rknn->output_num = (int)io_num.n_output;
 
+    /* 查询每个索引的真实属性，不能只知道输入输出数量就假定布局。
+     * 保存的类型、元素数和格式既供预处理选择路径，也用于 set_input 的长度校验。 */
     for (int i = 0; i < rknn->input_num; ++i) {
         rknn_tensor_attr attr;
         memset(&attr, 0, sizeof(attr));
@@ -201,6 +211,7 @@ fail:
     return -EINVAL;
 }
 
+/** @brief 校验输入元素大小与数量后提交普通内存张量，允许运行时按模型要求转换。 */
 int ocr_rknn_set_input_ex(ocr_rknn_t *rknn, int idx,
                           const void *data, uint32_t size,
                           rknn_tensor_type type, rknn_tensor_format fmt)
@@ -216,6 +227,8 @@ int ocr_rknn_set_input_ex(ocr_rknn_t *rknn, int idx,
 
     element_size = tensor_type_size(type);
     if (element_size <= 0) return -ENOTSUP;
+    /* 校验调用者提供的源类型所需字节数，而非模型内部量化存储的字节数。
+     * 例如模型内部 INT8、源张量 FLOAT32，源缓冲仍应为 n_elems*4 字节。 */
     expected_size = (uint64_t)rknn->inputs[idx].n_elems * (uint32_t)element_size;
     if (expected_size != size) {
         LOG_E("RKNN input %d size mismatch: got=%u expected=%llu", idx, size,
@@ -227,6 +240,8 @@ int ocr_rknn_set_input_ex(ocr_rknn_t *rknn, int idx,
     input.index = (uint32_t)idx;
     input.buf = (void *)data;
     input.size = size;
+    /* pass_through=0 允许运行时根据源 type/fmt 转换到模型输入要求。
+     * 这里既没有传 DMA-BUF fd，也没有设置原生零拷贝 IO memory。 */
     input.pass_through = 0;
     input.type = type;
     input.fmt = fmt;
@@ -236,6 +251,8 @@ int ocr_rknn_set_input_ex(ocr_rknn_t *rknn, int idx,
         LOG_E("rknn_inputs_set(%d) failed: %d", idx, ret);
         return -EIO;
     }
+    /* 只记录借用指针，用于 run 前检查本轮每个输入都已设置；不接管 data，
+     * 上层须保证输入缓冲在同步推理期间有效，尤其不能让另一个线程覆盖工作区。 */
     rknn->input_bufs[idx] = data;
     return 0;
 }
@@ -250,6 +267,7 @@ int ocr_rknn_set_input(ocr_rknn_t *rknn, int idx,
         (rknn_tensor_format)rknn->inputs[idx].fmt);
 }
 
+/** @brief 占位接口：尚未定义模型原生布局及 stride 约定，明确返回 -ENOTSUP。 */
 int ocr_rknn_set_input_dmabuf(ocr_rknn_t *rknn, int idx,
                               int fd, uint32_t size)
 {
@@ -265,6 +283,7 @@ int ocr_rknn_set_input_dmabuf(ocr_rknn_t *rknn, int idx,
     return -ENOTSUP;
 }
 
+/** @brief 释放上次输出、执行推理并获取本次输出；当前输出统一请求浮点格式。 */
 int ocr_rknn_run(ocr_rknn_t *rknn)
 {
     rknn_output outputs[RKNN_MAX_IO];
@@ -277,9 +296,12 @@ int ocr_rknn_run(ocr_rknn_t *rknn)
         }
     }
 
+    /* 开始新一轮前先归还上次结果，所有通过 get_output 借出的旧指针随即失效。
+     * encoder 和 decoder 各有独立上下文，所以 decoder 运行不会释放 encoder 状态。 */
     release_outputs(rknn);
 
     int ret = rknn_run(rknn->rknn_ctx, NULL);
+    /* 清空本轮输入标记，强制下一轮重新设置全部输入，避免误用旧张量或悬空指针。 */
     memset(rknn->input_bufs, 0, sizeof(rknn->input_bufs));
     if (ret < 0) {
         LOG_E("rknn_run failed: %d", ret);
@@ -289,6 +311,8 @@ int ocr_rknn_run(ocr_rknn_t *rknn)
     memset(outputs, 0, sizeof(outputs));
     for (int i = 0; i < rknn->output_num; ++i) {
         outputs[i].index = (uint32_t)i;
+        /* 统一浮点输出，OCR/翻译后处理无需各自处理 INT8 反量化。
+         * is_prealloc=0 由 RKNN 分配返回缓冲，只能 outputs_release，不能 free。 */
         outputs[i].want_float = 1;
         outputs[i].is_prealloc = 0;
     }
@@ -297,7 +321,8 @@ int ocr_rknn_run(ocr_rknn_t *rknn)
                            outputs, NULL);
     if (ret < 0) {
         LOG_E("rknn_outputs_get failed: %d", ret);
-        /* Some runtime versions may have filled a subset before failing. */
+        /* 有的运行时可能在报错前已返回部分输出；检查实际指针后释放，
+         * 不能因为 outputs_get 最终失败就假定没有资源需要归还。 */
         int has_output = 0;
         for (int i = 0; i < rknn->output_num; ++i) {
             if (outputs[i].buf) has_output = 1;
@@ -326,6 +351,7 @@ int ocr_rknn_run(ocr_rknn_t *rknn)
     return 0;
 }
 
+/** @brief 借用上下文持有的输出指针；调用者不能 free，下一次推理前应完成使用。 */
 int ocr_rknn_get_output(ocr_rknn_t *rknn, int idx,
                         void **data, uint32_t *size)
 {
@@ -333,6 +359,8 @@ int ocr_rknn_get_output(ocr_rknn_t *rknn, int idx,
         idx < 0 || idx >= rknn->output_num || !data) {
         return -EINVAL;
     }
+    /* 这里只返回视图而不复制；需要跨下一轮推理长期保存时，上层应另行复制。
+     * 输出不是 ocr_buffer_t，不能用其 ref/unref 管理。 */
     *data = rknn->output_bufs[idx];
     if (size) *size = rknn->output_sizes[idx];
     return *data ? 0 : -EIO;

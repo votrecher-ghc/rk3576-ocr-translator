@@ -1,4 +1,8 @@
-/** @file drm_sink.c @brief Synchronous VSync-aware DRM pipeline sink. */
+/** @file drm_sink.c @brief Synchronous VSync-aware DRM pipeline sink.
+ *
+ * 显示节点额外持有当前扫描帧的引用，提交下一帧并确认切换后才释放上一帧。
+ * framebuffer 缓存按缓冲对象及布局复用；销毁前先停止扫描，避免输出池过早复用图像。
+ */
 #include "drm_sink.h"
 #include "log.h"
 
@@ -6,7 +10,9 @@
 static int entry_matches(const ocr_drm_sink_entry_t *entry,
                          const ocr_buffer_t *buffer)
 {
-    /* Pool buffer objects and their owned fd remain stable until sink destroy. */
+    /* 同一池对象和 fd 跨帧复用，所以缓存匹配不需要 frame_id。
+     * 但 fd 整数可被系统复用，不能单独按 fd 匹配，还要核对源对象和全部布局。
+     * 约定：sink 在池之前销毁，缓存内借用的 source 指针才始终有效。 */
     return entry->valid && entry->source == buffer &&
            entry->source_fd == buffer->fd &&
            entry->source_size == buffer->size &&
@@ -17,6 +23,7 @@ static int entry_matches(const ocr_drm_sink_entry_t *entry,
            memcmp(entry->offsets, buffer->offsets, sizeof(entry->offsets)) == 0;
 }
 
+/** @brief 按稳定的池缓冲及布局缓存 framebuffer，缓存满时只淘汰非当前扫描条目。 */
 static ocr_drm_sink_entry_t *find_or_create_fb(ocr_drm_sink_t *sink,
                                                 const ocr_buffer_t *buffer)
 {
@@ -44,6 +51,8 @@ static ocr_drm_sink_entry_t *find_or_create_fb(ocr_drm_sink_t *sink,
     }
     if (!free_entry) return NULL;
 
+    /* 第一次遇到某块输出池内存才做 PRIME 导入和 AddFB2，以后新帧换内容但
+     * 不换布局，直接复用 fb_id，避免每一帧重复创建/销毁 DRM 对象。 */
     const uint32_t *strides = buffer->plane_count ? buffer->strides : NULL;
     const uint32_t *offsets = buffer->plane_count ? buffer->offsets : NULL;
     if (ocr_drm_fb_create_with_layout(sink->dev, buffer, strides, offsets,
@@ -75,18 +84,24 @@ int ocr_drm_sink_init(ocr_drm_sink_t *sink, ocr_drm_device_t *dev,
     return 0;
 }
 
+/** @brief 额外引用新帧，确认切换成功后替换 current 并释放旧帧；失败则撤销新引用。 */
 int ocr_drm_sink_present(ocr_drm_sink_t *sink, ocr_buffer_t *buffer)
 {
     if (!buffer) return -1;
     if (!sink || !sink->initialized || buffer->fd < 0) return -2;
+    /* 帧标识与内存标识都相同才可跳过重复提交；相同指针本身不表示同一幅图像。
+     * current 持有引用，正常使用期间生产者不能复用它改写成另一帧。 */
     if (sink->current == buffer && sink->current_frame_id == buffer->frame_id)
         return 0;
 
     ocr_drm_sink_entry_t *entry = find_or_create_fb(sink, buffer);
     if (!entry) return -3;
+    /* 工作线程的输入引用在回调返回后会释放；扫描输出必须另持一份引用。 */
     if (ocr_buffer_ref(buffer) < 0) return -4;
 
     int present_ret;
+    /* 首帧还没有活动扫描源，SetCrtc/modeset 建立 primary；后续在 VSync 时翻页。
+     * 整个调用同步等待切换，当前没有 atomic IN_FENCE_FD/OUT_FENCE_PTR 链路。 */
     if (!sink->dev->mode_set) {
         present_ret = ocr_drm_plane_set_fb_ex(
             sink->planes, sink->planes->primary, entry->fb.fb_id,
@@ -99,11 +114,14 @@ int ocr_drm_sink_present(ocr_drm_sink_t *sink, ocr_buffer_t *buffer)
             sink->planes->primary->in_use = 1;
         }
     }
+    /* 失败不更新 current，撤销本次额外引用。注意返回码包括“提交失败”和
+     * “提交成功但完成等待失败”；后者的实际扫描状态要结合底层查询结果判断。 */
     if (present_ret != 0) {
         (void)ocr_buffer_unref(buffer);
         return -5;
     }
 
+    /* 新帧切换完成后才释放旧帧。新帧仍在被显示控制器读取，保留在 current。 */
     ocr_buffer_t *previous = sink->current;
     sink->current = buffer;
     sink->current_entry = entry;
@@ -118,6 +136,7 @@ int ocr_drm_sink_process(ocr_pipeline_node_t *node, ocr_buffer_t *buffer)
     return ocr_drm_sink_present((ocr_drm_sink_t *)node->user_ctx, buffer);
 }
 
+/** @brief 先解除 primary 扫描输出，再释放当前帧和 framebuffer 缓存。 */
 void ocr_drm_sink_destroy(ocr_drm_sink_t *sink)
 {
     if (!sink || !sink->initialized) return;
@@ -128,6 +147,8 @@ void ocr_drm_sink_destroy(ocr_drm_sink_t *sink)
             return;
         }
 
+    /* disable 成功后显示控制器才不再读取 current；此时最后一次 unref 即使
+     * 立即把缓冲送回输出池，也不会让 RGA 覆盖仍在扫描的图像。 */
     if (sink->current) {
         (void)ocr_buffer_unref(sink->current);
         sink->current = NULL;

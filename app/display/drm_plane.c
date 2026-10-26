@@ -1,6 +1,9 @@
 /**
  * @file drm_plane.c
  * @brief DRM Plane 能力筛选与 legacy KMS 设置
+ *
+ * 按 CRTC 兼容性和像素格式选择 NV12 primary 及可选 ARGB overlay，并设置显示区域。
+ * 源坐标使用 KMS 的 16.16 格式，目标坐标使用屏幕像素；退出时只处理本模块选中的 plane。
  */
 #include "drm_plane.h"
 #include "log.h"
@@ -12,8 +15,8 @@
 #include <string.h>
 
 typedef struct {
-    ocr_drm_plane_t plane;
-    int type_known;
+    ocr_drm_plane_t plane; /**< 枚举所得 plane 的能力与属性值副本，选中后复制到管理器内嵌数组。 */
+    int type_known; /**< 成功读取 type 属性时为 1；评分时区分已确认类型与未知类型候选。 */
 } plane_candidate_t;
 
 static int plane_has_format(const drmModePlane *plane, uint32_t format)
@@ -71,6 +74,7 @@ static void read_plane_properties(int fd, uint32_t plane_id,
     drmModeFreeObjectProperties(props);
 }
 
+/** @brief 仅为兼容当前 CRTC 且支持 NV12 的 primary 候选评分。 */
 static int base_score(const plane_candidate_t *candidate, uint32_t crtc_id)
 {
     if (!candidate->plane.supports_nv12) return -1;
@@ -83,6 +87,7 @@ static int base_score(const plane_candidate_t *candidate, uint32_t crtc_id)
     return score;
 }
 
+/** @brief 只选择空闲并支持 ARGB 的 overlay，避免抢占其他显示输出。 */
 static int overlay_score(const plane_candidate_t *candidate, uint32_t crtc_id)
 {
     (void)crtc_id;
@@ -110,6 +115,7 @@ static void try_set_property(ocr_drm_device_t *dev, ocr_drm_plane_t *plane,
     }
 }
 
+/** @brief 联合挑选两个不同 plane，避免 primary 抢占唯一可用的文字叠加层。 */
 int ocr_drm_planes_init(ocr_drm_planes_t *planes, ocr_drm_device_t *dev)
 {
     if (!planes || !dev || !dev->opened || dev->fd < 0 ||
@@ -253,6 +259,7 @@ int ocr_drm_planes_init(ocr_drm_planes_t *planes, ocr_drm_device_t *dev)
     return 0;
 }
 
+/** @brief 设置源裁剪和目标区域；首帧 primary 使用 modeset，后续通过 SetPlane 更新。 */
 int ocr_drm_plane_set_fb_ex(ocr_drm_planes_t *planes, ocr_drm_plane_t *plane,
                             uint32_t fb_id,
                             uint32_t src_x, uint32_t src_y,
@@ -316,6 +323,7 @@ int ocr_drm_plane_set_fb(ocr_drm_planes_t *planes, ocr_drm_plane_t *plane,
                                    0, 0, w, h, x, y, w, h);
 }
 
+/** @brief 解除选定 plane 的扫描绑定；primary 通过关闭 CRTC 实现。 */
 int ocr_drm_plane_disable(ocr_drm_planes_t *planes, ocr_drm_plane_t *plane)
 {
     if (!planes || !plane || !planes->dev || !planes->dev->opened ||

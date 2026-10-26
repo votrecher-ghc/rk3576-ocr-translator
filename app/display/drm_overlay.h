@@ -3,35 +3,35 @@
 /**
  * @file drm_overlay.h
  * @brief 翻译结果叠加渲染（FreeType 文字渲染到 ARGB framebuffer）
+ *
+ * 文字叠加使用两块 ARGB8888 DRM dumb buffer：CPU 绘制后台缓冲，再提交 overlay plane。
+ * 前后缓冲按提交和 vblank 时序交替使用；PRIME fd 仅供可选共享，扫描输出直接使用 framebuffer。
  */
 
 #include "drm_device.h"
 #include "drm_plane.h"
+#include "text_renderer.h"
 #include <stddef.h>
-#include <ft2build.h>
-#include FT_FREETYPE_H
 
 #define OVERLAY_MAX_TEXT 256
 
 /** 叠加渲染上下文 */
 typedef struct {
-    ocr_drm_device_t *dev;
-    ocr_drm_planes_t *planes;
-    FT_Library        ft_lib;      /* FreeType 库 */
-    FT_Face           ft_face;     /* 字体面 */
-    int               font_size;   /* 字号 */
-    uint32_t          width;       /* 叠加层宽 */
-    uint32_t          height;      /* 叠加层高 */
-    uint32_t          pitch[2];       /* 双缓冲行跨度 */
-    void             *pixels[2];      /* mmap 的 DRM dumb buffer */
-    size_t            pixel_size[2];  /* dumb buffer 映射大小 */
-    int               dmabuf_fd[2];   /* 可选 PRIME fd */
-    uint32_t          fb_id[2];       /* DRM FB ID */
-    uint32_t          gem_handle[2];  /* dumb GEM handle */
-    int               draw_index;     /* 当前 CPU 绘制的非 scanout buffer */
-    int               active_index;   /* 当前 scanout buffer，-1=尚未提交 */
-    int               initialized; /* 完整初始化标志 */
-    int               resource_active; /* init 已建立资源生命周期 */
+    ocr_drm_device_t *dev; /**< 借用的 DRM 设备，须在 overlay 销毁及双缓冲退出扫描后再关闭。 */
+    ocr_drm_planes_t *planes; /**< 借用的 plane 管理器，使用其可选 overlay；本模块不销毁管理器。 */
+    ocr_text_renderer_t text; /**< 本实例独占的文字渲染器（字体与字号），只由显示线程使用；destroy 释放。 */
+    uint32_t          width; /**< 文字层有效宽度，屏幕像素，用于字形裁边和 dumb buffer 分配。 */
+    uint32_t          height; /**< 文字层有效高度，屏幕像素，与视频层共同映射到显示区域。 */
+    uint32_t          pitch[2]; /**< 两块 ARGB 缓冲各自的字节行跨度，内核可能加入对齐；逐行绘制必须使用。 */
+    void             *pixels[2]; /**< 本模块 mmap 的两块 dumb buffer CPU 地址，destroy 时 munmap。 */
+    size_t            pixel_size[2]; /**< 两块缓冲各自的完整映射长度，字节；可能大于 width*height*4。 */
+    int               dmabuf_fd[2]; /**< 两块缓冲可选 PRIME 导出 fd，-1 表示未导出；本模块拥有并关闭。 */
+    uint32_t          fb_id[2]; /**< 两块文字层 framebuffer ID，与同索引 pixels/gem_handle 配对；destroy 时 RmFB。 */
+    uint32_t          gem_handle[2]; /**< 两块 CREATE_DUMB 返回的 GEM handle，由本模块销毁 dumb buffer。 */
+    int               draw_index; /**< 下一次 CPU 绘制的后台缓冲下标 0/1；必须与当前扫描缓冲不同。 */
+    int               active_index; /**< 已提交为扫描源的缓冲下标；-1 表示尚未提交或扫描状态未知。 */
+    int               initialized; /**< 允许绘制/提交的标志；翻页时点未知时可置 0，但仍可能需要清理资源。 */
+    int               resource_active; /**< 已进入资源生命周期的标记；即使 initialized=0 也据此继续清理已申请资源。 */
 } ocr_drm_overlay_t;
 
 /**

@@ -1,3 +1,8 @@
+/**
+ * @file test_motion_compensate.c
+ * 用可控的四元数姿态变化检查位移方向、固定缩放和裁剪限幅。
+ * 此处验证数学输出，实际 RGA 是否按板级坐标正确移动仍由设备联调验证。
+ */
 #include "motion_compensate.h"
 
 #include <assert.h>

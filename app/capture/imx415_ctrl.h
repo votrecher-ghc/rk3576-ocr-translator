@@ -5,17 +5,20 @@
  * @brief IMX415 摄像头控制：曝光/增益/分辨率切换
  *
  * 通过 V4L2 扩展控件（VIDIOC_S_EXT_CTRLS）控制 IMX415 传感器参数。
+ *
+ * 通过摄像头 V4L2 control 接口设置曝光、增益和自动曝光。
+ * 这些控制只调整已打开设备的参数，不分配图像缓冲，也不负责启动采集流。
  */
 
 #include <stdint.h>
 
 /** IMX415 控制上下文 */
 typedef struct {
-    int      v4l2_fd;     /* V4L2 设备 fd */
-    int32_t  exposure;    /* 当前曝光值（单位取决于传感器） */
-    int32_t  gain;        /* 当前增益（dB*100） */
-    int32_t  max_exposure;/* 曝光上限 */
-    int32_t  max_gain;    /* 增益上限 */
+    int      v4l2_fd; /**< 借用采集器打开的 video fd；此控制器不 close，也不独立持有图像缓冲。 */
+    int32_t  exposure; /**< 最近一次成功 S_CTRL 写入的曝光控件值；不是每帧测量或自动曝光实时结果。 */
+    int32_t  gain; /**< 最近一次成功设置的 V4L2_CID_GAIN 原始控件值；代码不做 dB 单位换算。 */
+    int32_t  max_exposure; /**< QUERYCTRL 返回的曝光最大控件值；查询失败回退 100000，用于上限裁剪。 */
+    int32_t  max_gain; /**< QUERYCTRL 返回的增益最大控件值；查询失败回退 4800，不保证不同驱动同单位。 */
 } ocr_imx415_t;
 
 /**

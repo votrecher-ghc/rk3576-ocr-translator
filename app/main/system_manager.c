@@ -1,6 +1,9 @@
 /**
  * @file system_manager.c
  * @brief 系统管理实现：信号处理/优雅退出/看门狗
+ *
+ * 系统生命周期、退出信号和软件看门狗管理。
+ * 信号处理只记录退出信号，常规线程再处理退出；看门狗检查主循环喂狗时间并请求统一退出。
  */
 #include "system_manager.h"
 #include "timestamp.h"
@@ -13,12 +16,14 @@
 static volatile sig_atomic_t s_exit_signal = 0;
 
 /* 信号处理函数 */
+/** @brief 信号上下文中只写 sig_atomic_t 标志，不调用日志、锁或资源清理函数。 */
 static void signal_handler(int sig)
 {
     s_exit_signal = sig;
 }
 
 /* 看门狗线程入口 */
+/** @brief 周期检查喂狗时间；超时请求应用退出，由正常清理路径回收资源。 */
 static void *watchdog_thread(void *arg)
 {
     ocr_system_manager_t *sm = (ocr_system_manager_t *)arg;
@@ -105,6 +110,7 @@ void ocr_system_manager_feed(ocr_system_manager_t *sm)
     atomic_fetch_add(&sm->feed_count, 1);
 }
 
+/** @brief 保存退出码并发布退出请求，供主循环统一响应。 */
 void ocr_system_manager_request_exit(ocr_system_manager_t *sm, int code)
 {
     if (!sm) return;

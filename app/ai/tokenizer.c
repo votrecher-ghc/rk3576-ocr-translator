@@ -6,6 +6,9 @@
  * TOKENIZER_GREEDY is a project-specific vocabulary-only contract; it is not a
  * generic BPE/SentencePiece implementation because no merge ranks or normalizer
  * metadata are available at runtime.
+ *
+ * 词表分词与还原：校验 UTF-8、查找特殊 token，并按所选模式切分或拼接文本。
+ * 编码结果和解码字符串均受调用方容量限制；模型必须与词表、分词模式及特殊 token 编号一致。
  */
 #include "tokenizer.h"
 #include "log.h"
@@ -16,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+/** @brief 解码一个 UTF-8 码点，拒绝截断、非法续字节及非规范编码。 */
 static int utf8_decode(const unsigned char *s, size_t remaining,
                        uint32_t *codepoint)
 {
@@ -44,6 +48,8 @@ static int utf8_decode(const unsigned char *s, size_t remaining,
         if ((s[i] & 0xC0u) != 0x80u) return -1;
         cp = (cp << 6) | (s[i] & 0x3Fu);
     }
+    /* 续字节形状正确仍可能非法：拒绝过长编码、UTF-16 代理区和超出 Unicode
+     * 上限的值，保证后面按字节匹配的子词边界确实对应完整码点。 */
     if ((len == 3 && cp < 0x800u) || (len == 4 && cp < 0x10000u) ||
         (cp >= 0xD800u && cp <= 0xDFFFu) || cp > 0x10FFFFu) {
         return -1;
@@ -89,6 +95,7 @@ static int lookup_special(const ocr_tokenizer_t *tok,
     return -1;
 }
 
+/** @brief 加载并校验词表，定位 PAD/BOS/EOS/UNK 等特殊 token。 */
 int tokenizer_init(ocr_tokenizer_t *tok, const char *vocab_path,
                    tokenizer_type_t type)
 {
@@ -224,6 +231,7 @@ static int append_id(int32_t *ids, int *count, int capacity, int id)
     return 1;
 }
 
+/** @brief 对一个词段执行最长前缀匹配，后续子词使用词表约定的续接前缀。 */
 static int encode_wordpiece_span(const ocr_tokenizer_t *tok,
                                  const unsigned char *span, size_t span_len,
                                  int32_t *ids, int *count, int capacity)
@@ -256,6 +264,8 @@ static int encode_wordpiece_span(const ocr_tokenizer_t *tok,
         }
 
         if (best_id < 0) {
+            /* 一个词段中途无法继续切分时，撤销这整个词段已经产生的子词，
+             * 用一个 UNK 替代；不能留下“前半词识别成功、后半词丢失”的半截结果。 */
             *count = initial_count;
             return append_id(ids, count, capacity, tok->unk_id) ? 0 : 1;
         }
@@ -265,6 +275,7 @@ static int encode_wordpiece_span(const ocr_tokenizer_t *tok,
     return 0;
 }
 
+/** @brief 先区分空白、汉字和其他词段，再逐段进行 WordPiece 切分。 */
 static int encode_wordpiece(const ocr_tokenizer_t *tok, const char *text,
                             int32_t *ids, int *count, int capacity)
 {
@@ -311,9 +322,13 @@ static int encode_wordpiece(const ocr_tokenizer_t *tok, const char *text,
     return 0;
 }
 
+/** @brief 按当前词表实现贪心子词匹配，匹配边界必须落在完整 UTF-8 码点之间。 */
 static int encode_bpe(const ocr_tokenizer_t *tok, const char *text,
                       int32_t *ids, int *count, int capacity)
 {
+    /* 当前是词表最长贪心匹配，识别 SentencePiece/GPT 风格的词首标记；
+     * 不读取 merges/rank 表，所以不能把任意外部分词器资产视为等价实现。
+     * 翻译 manifest 使用 greedy-vocab-v1 正是为了固定这一约定。 */
     static const unsigned char sp_marker[] = {0xE2, 0x96, 0x81}; /* U+2581 */
     static const unsigned char gpt_marker[] = {0xC4, 0xA0};      /* U+0120 */
     const unsigned char *bytes = (const unsigned char *)text;
@@ -375,6 +390,7 @@ static int encode_bpe(const ocr_tokenizer_t *tok, const char *text,
     return 0;
 }
 
+/** @brief 编码到调用者提供的 token 数组，按容量保留特殊 token 所需空间。 */
 int tokenizer_encode(ocr_tokenizer_t *tok, const char *text,
                      int32_t *ids, int max_ids)
 {
@@ -392,6 +408,8 @@ int tokenizer_encode(ocr_tokenizer_t *tok, const char *text,
     if (tok->bos_id >= 0 && !append_id(ids, &count, capacity, tok->bos_id)) {
         return count;
     }
+    /* 为 EOS 预留一格，避免正文恰好填满后没有结束标记；BOS 已先占用一格。
+     * capacity 同时受调用者数组长度与 tokenizer.max_len 约束，后者按 token 数而非字节数计。 */
     payload_capacity = capacity - (tok->eos_id >= 0 ? 1 : 0);
     if (payload_capacity < count) payload_capacity = count;
 
@@ -432,6 +450,7 @@ static int token_is_single_cjk(const char *token)
     return char_len > 0 && (size_t)char_len == len && is_cjk(cp);
 }
 
+/** @brief 跳过控制 token，按分词模式还原文本；输出空间不足返回错误。 */
 int tokenizer_decode(ocr_tokenizer_t *tok, const int32_t *ids, int count,
                      char *text, int text_size)
 {
@@ -458,6 +477,8 @@ int tokenizer_decode(ocr_tokenizer_t *tok, const int32_t *ids, int count,
         len = strlen(piece);
 
         if (tok->type == TOKENIZER_WORDPIECE) {
+            /* ## 表示词内续接，去掉标记后直接拼接；新英文词通常补空格，
+             * 单个汉字和 ASCII 标点不按英文词强行插入空格。 */
             int continuation = len >= 2 && piece[0] == '#' && piece[1] == '#';
             if (continuation) {
                 piece += 2;

@@ -1,3 +1,8 @@
+/**
+ * @file test_ringbuffer.c
+ * 验证满容量、环绕、非二次幂容量、非法参数及真实双线程 SPSC 顺序。
+ * 并发测试只有一个生产者和一个消费者，与生产队列的使用约定一致。
+ */
 /*
  * Unit tests for the production lock-free SPSC ring buffer.
  */
@@ -19,6 +24,7 @@
         }                                                                      \
     } while (0)
 
+/** @brief 确认声明的全部槽位都可用，额外一次 push 返回满且不覆盖旧元素。 */
 static void test_full_capacity(void)
 {
     ocr_ringbuffer_t rb;
@@ -44,6 +50,7 @@ static void test_full_capacity(void)
     ocr_ringbuffer_destroy(&rb);
 }
 
+/** @brief 反复入队和出队跨越物理数组末端，验证元素顺序和槽位复用。 */
 static void test_wraparound(void)
 {
     ocr_ringbuffer_t rb;
@@ -71,6 +78,7 @@ static void test_wraparound(void)
     ocr_ringbuffer_destroy(&rb);
 }
 
+/** @brief 覆盖取模索引路径，防止实现误把所有容量都当成二次幂。 */
 static void test_non_power_of_two_capacity(void)
 {
     ocr_ringbuffer_t rb;
@@ -96,8 +104,8 @@ static void test_non_power_of_two_capacity(void)
 #define CONCURRENT_CAPACITY ((size_t)256)
 
 typedef struct {
-    ocr_ringbuffer_t rb;
-    atomic_size_t consumed;
+    ocr_ringbuffer_t rb; /**< 内嵌受测 SPSC 队列，一个生产者写、一个消费者读，主测试负责销毁。 */
+    atomic_size_t consumed; /**< 消费者已按顺序核验的元素数，原子发布给主测试线程。 */
 } concurrent_fixture_t;
 
 static void *producer_main(void *arg)
@@ -129,6 +137,7 @@ static void *consumer_main(void *arg)
     return NULL;
 }
 
+/** @brief 让生产者和消费者独立运行，检查大量元素跨线程传递仍保持顺序。 */
 static void test_concurrent_spsc(void)
 {
     concurrent_fixture_t fixture;
