@@ -1,6 +1,9 @@
 /**
  * @file drm_overlay.c
  * @brief DRM dumb buffer 上的 FreeType ARGB 文字叠加
+ *
+ * 文字叠加使用两块 ARGB8888 DRM dumb buffer：CPU 绘制后台缓冲，再提交 overlay plane。
+ * 前后缓冲按提交和 vblank 时序交替使用；PRIME fd 仅供可选共享，扫描输出直接使用 framebuffer。
  */
 #include "drm_overlay.h"
 #include "log.h"
@@ -17,6 +20,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+/** @brief 创建可供 CPU 绘制的 ARGB 缓冲和 framebuffer，PRIME 导出失败不影响本地显示。 */
 static int create_dumb_overlay(ocr_drm_overlay_t *overlay, int index)
 {
     struct drm_mode_create_dumb create_req;
@@ -240,6 +244,7 @@ static void blend_pixel(uint32_t *dst, uint32_t color, uint8_t coverage)
     *dst = (out_a << 24) | (out_r << 16) | (out_g << 8) | out_b;
 }
 
+/** @brief 把 FreeType 字形按覆盖率混合到后台缓冲，逐行寻址必须使用 DRM pitch。 */
 int ocr_overlay_render_text(ocr_drm_overlay_t *overlay, const char *text,
                             int x, int y, uint32_t color)
 {
@@ -327,6 +332,7 @@ int ocr_overlay_clear(ocr_drm_overlay_t *overlay)
     return 0;
 }
 
+/** @brief 等待选定 CRTC 的下一次 vblank，供前后缓冲交换使用。 */
 static int wait_overlay_vblank(ocr_drm_overlay_t *overlay)
 {
     drmVBlank vblank;
@@ -353,6 +359,7 @@ static int wait_overlay_vblank(ocr_drm_overlay_t *overlay)
     }
 }
 
+/** @brief 提交后台文字层并按 vblank 时序交换绘制缓冲，避免立即覆写前台。 */
 int ocr_overlay_commit(ocr_drm_overlay_t *overlay)
 {
     if (!overlay || !overlay->initialized || !overlay->planes ||
@@ -362,7 +369,9 @@ int ocr_overlay_commit(ocr_drm_overlay_t *overlay)
     }
 
     int next = overlay->draw_index;
-    /* 只提交非 scanout buffer；下一帧再绘制刚刚退役的另一块 buffer。 */
+    /* 只提交非 scanout buffer；下一帧再绘制刚刚退役的另一块 buffer。
+     * CPU 内存屏障约束写入排序，不等同于 DMA_BUF_IOCTL_SYNC；本路径通过
+     * DRM dumb buffer 映射绘制，映射的缓存属性由 DRM 驱动决定。 */
     __sync_synchronize();
     int ret = ocr_drm_plane_set_fb_ex(
         overlay->planes, overlay->planes->overlay, overlay->fb_id[next],

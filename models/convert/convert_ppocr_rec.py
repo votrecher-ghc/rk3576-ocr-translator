@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# 识别模型转换入口：准备 ONNX，按脚本配置构建并导出 RKNN。
+# 输入尺寸和 CTC 类别/词表顺序需与 app/ai/ocr_rec.c 的初始化检查一致。
 """
 将 PaddleOCR 文本识别模型 (ppocrv4_rec) 转换为 RKNN 格式。
 

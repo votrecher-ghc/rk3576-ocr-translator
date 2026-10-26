@@ -1,3 +1,8 @@
+/**
+ * @file test_config.c
+ * 读取项目配置并检查解析后的关键字段，同时构造超长设备路径验证拒绝行为。
+ * 主机测试不打开真实摄像头、显示设备或模型，配置路径由 CMake 注入。
+ */
 /* Unit tests for parsing the checked-in application configuration. */
 
 #include "config.h"

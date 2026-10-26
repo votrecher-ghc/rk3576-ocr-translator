@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
+/**
+ * @file gpio_capture_key.c
+ * GPIO 拍照键：双边沿中断只重启消抖计时，延迟工作读取稳定逻辑电平并上报 input 事件。
+ * GPIO active-low 已由描述符接口转换为逻辑值，不能在业务代码中再次取反。
+ */
 /*
  * GPIO capture key driver for the RK3576 OCR translator.
  *
@@ -23,18 +28,19 @@
 #define OCR_CAPTURE_KEY_DEFAULT_DEBOUNCE_MS  20
 
 struct ocr_capture_key {
-	struct device *dev;
-	struct gpio_desc *gpiod;
-	struct input_dev *input;
-	struct delayed_work debounce_work;
-	const char *label;
-	unsigned int code;
-	unsigned int debounce_ms;
-	int irq;
-	bool last_pressed;
-	bool irq_wake_enabled;
+	struct device *dev; /**< 借用平台父设备，用于属性、日志和唤醒配置，生命周期由设备 core 管理。 */
+	struct gpio_desc *gpiod; /**< devm 申请的输入 GPIO 描述符，读取值已包含 active-low 的逻辑极性转换。 */
+	struct input_dev *input; /**< 注册给 input 子系统的按键设备，devm 管理，不在回调中自行释放。 */
+	struct delayed_work debounce_work; /**< 内嵌延迟消抖任务，边沿中断重排截止时间，退出前同步取消。 */
+	const char *label; /**< 借用的设备属性字符串或静态默认标签，用作输入设备名称，非动态复制字符串。 */
+	unsigned int code; /**< Linux input 按键码，默认 KEY_CAMERA；不是 GPIO 电气编号。 */
+	unsigned int debounce_ms; /**< 每次边沿后等待稳定电平的时间，毫秒；默认 20。 */
+	int irq; /**< 由 GPIO 映射出的 IRQ 编号，用于注册中断及系统唤醒配置。 */
+	bool last_pressed; /**< 最近已上报的逻辑按下状态；消抖后不变则不重复发送事件。 */
+	bool irq_wake_enabled; /**< 成功为本 IRQ 开启唤醒的标志，resume/cleanup 据此配对撤销。 */
 };
 
+/* 消抖结束后在可睡眠上下文读取 GPIO，状态变化才发送按下/释放事件。 */
 static void ocr_capture_key_report_work(struct work_struct *work)
 {
 	struct ocr_capture_key *key =
@@ -59,6 +65,8 @@ static void ocr_capture_key_report_work(struct work_struct *work)
 	if (pressed == key->last_pressed)
 		return;
 
+	/* 消抖后仍与上次状态相同就不重复上报；状态变化时发送键值，再 input_sync
+	 * 标记这一包事件结束。这里的 sync 是 input 事件包边界，不是 DMA 缓存同步。 */
 	key->last_pressed = pressed;
 	input_report_key(key->input, key->code, pressed);
 	input_sync(key->input);
@@ -67,17 +75,20 @@ static void ocr_capture_key_report_work(struct work_struct *work)
 		pressed ? "pressed" : "released");
 }
 
+/* 每次电气边沿都重新开始消抖窗口，不在中断中直接执行拍照业务。 */
 static irqreturn_t ocr_capture_key_irq(int irq, void *private)
 {
 	struct ocr_capture_key *key = private;
 
-	/* Restart the debounce window on every electrical edge. */
+	/* 每来一个抖动边沿就把截止时刻后移，而不是为每个边沿创建一个拍照任务。
+	 * 硬中断只安排工作，不读可睡眠 GPIO，也不执行 JPEG/OCR 这类耗时处理。 */
 	mod_delayed_work(system_wq, &key->debounce_work,
 			 msecs_to_jiffies(key->debounce_ms));
 
 	return IRQ_HANDLED;
 }
 
+/* 先同步取消消抖任务，再撤销唤醒设置，避免任务访问已释放设备。 */
 static void ocr_capture_key_cleanup(void *private)
 {
 	struct ocr_capture_key *key = private;
@@ -93,6 +104,7 @@ static void ocr_capture_key_cleanup(void *private)
 		device_init_wakeup(key->dev, false);
 }
 
+/* 读取按键属性并申请 GPIO/IRQ，注册支持 KEY_CAMERA 或配置键码的 input 设备。 */
 static int ocr_capture_key_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;

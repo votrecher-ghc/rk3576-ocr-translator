@@ -1,3 +1,8 @@
+/**
+ * @file bench_rknn.c
+ * 旧版 RKNN 基准入口，展示输入设置、推理、取输出和计时流程。
+ * 当前仍含空模型初始化和预热桩调用，不能把本文件输出当成真实模型验收结果。
+ */
 /*
  * bench_rknn.c - NPU 性能基准测试
  *
@@ -25,11 +30,11 @@
 
 /* 待测模型列表 */
 typedef struct {
-    const char *name;          /* 模型名称 */
-    const char *path;          /* 模型文件路径 */
-    int         input_width;   /* 输入宽度 */
-    int         input_height;  /* 输入高度 */
-    int         input_channels;/* 输入通道数 */
+    const char *name; /**< 借用的静态模型说明标签，用于基准输出，不自动从模型查询。 */
+    const char *path; /**< 借用的静态模型文件路径；旧基准入口仍需完善真实模型加载。 */
+    int         input_width; /**< 基准表写死的输入宽度，像素，不是运行时查询的模型尺寸。 */
+    int         input_height; /**< 基准表写死的输入高度，像素；需与待测模型实际约定一致。 */
+    int         input_channels; /**< 基准输入通道数，与宽高相乘推算 UINT8 输入字节数。 */
 } bench_model_t;
 
 static bench_model_t models[] = {

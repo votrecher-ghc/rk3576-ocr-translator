@@ -1,6 +1,9 @@
 /**
  * @file config.c
  * @brief JSON 配置解析实现（基于 cJSON）
+ *
+ * 配置加载先填默认值，再按 JSON 字段覆盖并校验范围、路径及模式相关要求。
+ * 结构体内固定数组保存字符串，不借用 cJSON 内存；pipeline.json 仅为设计参考，运行时读取统一配置。
  */
 #include "config.h"
 #include "log.h"
@@ -96,6 +99,7 @@ static int cfg_run_mode(const cJSON *item, int fallback)
     return fallback;
 }
 
+/** @brief 集中设置所有缺省参数，JSON 缺少某字段时保留对应默认值。 */
 static void config_defaults(ocr_config_t *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
@@ -153,6 +157,7 @@ static void config_defaults(ocr_config_t *cfg)
     snprintf(cfg->pwm_path, sizeof(cfg->pwm_path), "%s", "kernel");
 }
 
+/** @brief 读取 JSON 并按字段类型覆盖默认值，最后校验可运行配置所需的范围和资产路径。 */
 int config_load(ocr_config_t *cfg, const char *path)
 {
     int path_too_long = 0;
@@ -160,6 +165,8 @@ int config_load(ocr_config_t *cfg, const char *path)
     if (!cfg || !path) {
         return -1;
     }
+    /* 配置是“默认值 + 按出现字段覆盖”，不是要求 JSON 必须列出全部字段。
+     * 默认值只填内存，配置文件不存在仍报错，不会静默以默认设备启动。 */
     config_defaults(cfg);
 
     FILE *fp = fopen(path, "rb");
@@ -311,6 +318,8 @@ int config_load(ocr_config_t *cfg, const char *path)
             path_too_long = 1;
     }
 
+    /* sensors 在 legacy hardware 之后解析，同一背光/PWM 路径两处都配置时，
+     * sensors 字段覆盖前面的值；这里只保存路径，设备是否可打开由模块初始化检查。 */
     const cJSON *sensors = cJSON_GetObjectItemCaseSensitive(root, "sensors");
     if (sensors && cJSON_IsObject(sensors)) {
         if (cfg_path(cfg->light_iio_device, sizeof(cfg->light_iio_device),
@@ -334,12 +343,17 @@ int config_load(ocr_config_t *cfg, const char *path)
             path_too_long = 1;
     }
 
+    /* 设备路径不能静默截断，截断后可能恰好变成另一个合法设备。解析过程中
+     * 累积这个错误标志，再统一销毁 cJSON 树并返回，避免遗漏错误分支。 */
     if (path_too_long) {
         cJSON_Delete(root);
         LOG_E("传感器或输入设备路径过长: %s", path);
         return -7;
     }
 
+    /* 集中检查跨模块约束：显示统一输出 NV12，所以其宽高都要求偶数；
+     * NV16/YUYV 采集仅要求偶数宽。缓冲数上限与 V4L2_MAX_BUFS 保持一致。
+     * 这一步检查数值约束，不代替模型 manifest、传感器探测或 DRM 模式协商。 */
     if (cfg->capture_width == 0 || cfg->capture_height == 0 || cfg->capture_fps == 0 ||
         cfg->display_width == 0 || cfg->display_height == 0 ||
         (strcasecmp(cfg->capture_format, "NV12") != 0 &&

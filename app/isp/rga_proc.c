@@ -1,6 +1,9 @@
 /**
  * @file rga_proc.c
  * @brief 图像处理节点实现
+ *
+ * RGA 节点从输出池取得空闲缓冲，继承帧号/时间戳，完成缩放或转换后发布新图像。
+ * 输入由节点借给回调；输出由 emit 转移所有权，返回正数防止节点再次转发原始输入。
  */
 #include "rga_proc.h"
 #include "rga_api.h"
@@ -22,6 +25,7 @@ int ocr_rga_proc_init(ocr_rga_proc_t *proc, ocr_buffer_pool_t *pool,
     return 0;
 }
 
+/** @brief 借用输入并取得独占输出，处理成功后 emit；返回 1 告知节点不要再转发输入。 */
 int ocr_rga_proc_process(ocr_pipeline_node_t *node, ocr_buffer_t *buf)
 {
     if (!node || !buf) return -1;
@@ -34,6 +38,8 @@ int ocr_rga_proc_process(ocr_pipeline_node_t *node, ocr_buffer_t *buf)
         LOG_W("RGA 处理：输出缓冲池耗尽");
         return -3;
     }
+    /* 处理配置与输出池必须一致；不能只改 out 的元数据来伪装尺寸，因为实际
+     * 分配容量/stride 仍属于旧尺寸，RGA 可能越界写入。 */
     if (out->width != proc->out_width || out->height != proc->out_height ||
         out->format != proc->out_format || out->plane_count == 0) {
         LOG_E("RGA output pool layout does not match processor configuration");
@@ -48,7 +54,8 @@ int ocr_rga_proc_process(ocr_pipeline_node_t *node, ocr_buffer_t *buf)
         buf->width == out->width && buf->height == out->height) {
         ret = ocr_rga_cvtcolor(buf, out);
     } else {
-        /* librga can resize and convert compatible formats in one blit. */
+        /* 需要缩放时让 librga 对支持的格式执行组合 blit，不在 CPU 中转色。
+         * 即便尺寸、格式都相同，仍需把输入图像写入另一块 out，不能空操作返回。 */
         ret = ocr_rga_resize(buf, out);
     }
 
@@ -57,6 +64,8 @@ int ocr_rga_proc_process(ocr_pipeline_node_t *node, ocr_buffer_t *buf)
         return ret;
     }
 
+    /* 成功提交后 emit 消费 out 的原引用，包括没有任何下游接收的情况。
+     * 只在负数错误时，out 引用仍归本回调，需要显式归还。 */
     int emitted = ocr_node_emit(node, out);
     if (emitted < 0) {
         (void)ocr_pool_release(proc->out_pool, out);

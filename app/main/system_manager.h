@@ -5,6 +5,9 @@
  * @brief 系统管理：信号处理(SIGINT/SIGTERM)、优雅退出、看门狗
  *
  * 统一管理应用生命周期：信号处理、优雅退出标志、看门狗监控线程。
+ *
+ * 系统生命周期、退出信号和软件看门狗管理。
+ * 信号处理只记录退出信号，常规线程再处理退出；看门狗检查主循环喂狗时间并请求统一退出。
  */
 
 #include <stdatomic.h>
@@ -20,13 +23,13 @@ typedef enum {
 
 /** 系统管理器上下文 */
 typedef struct {
-    atomic_int      state;        /* 当前状态 */
-    atomic_int      exit_code;    /* 退出码 */
-    atomic_int      feed_count;   /* 看门狗喂狗计数 */
-    ocr_thread_t    watchdog_tid; /* 看门狗线程 */
-    atomic_int      watchdog_running; /* 看门狗运行标志 */
-    uint32_t        watchdog_timeout_ms; /* 看门狗超时 */
-    uint64_t        start_time;   /* 启动时间 */
+    atomic_int      state; /**< 原子 sys_state_t 状态；大于等于 SHUTTING_DOWN 表示主循环应退出。 */
+    atomic_int      exit_code; /**< 原子退出码，request_exit 写入、主循环最终返回；正常通常为 0。 */
+    atomic_int      feed_count; /**< 原子喂狗次数，每次 feed 增 1；看门狗观察是否变化，不是上次喂狗时间戳。 */
+    ocr_thread_t    watchdog_tid; /**< 软件看门狗线程句柄，start 创建、stop 在清运行标志后 join。 */
+    atomic_int      watchdog_running; /**< 原子看门狗运行标志，用于重复启动保护及退出循环请求。 */
+    uint32_t        watchdog_timeout_ms; /**< 允许喂狗计数不变化的最长时间，毫秒；在线程启动前设置。 */
+    uint64_t        start_time; /**< 系统管理器初始化时的 CLOCK_MONOTONIC 毫秒值，不是墙上日期时间。 */
 } ocr_system_manager_t;
 
 /**

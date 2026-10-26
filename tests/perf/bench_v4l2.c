@@ -1,3 +1,8 @@
+/**
+ * @file bench_v4l2.c
+ * 板端 V4L2 MMAP 采集基准：统计取帧数量及 DQBUF 调用耗时，取帧后立即归还缓冲。
+ * 测得的是采集队列操作耗时，不包含 RGA、显示或 OCR，也不等于曝光到屏幕的端到端延迟。
+ */
 /*
  * bench_v4l2.c - V4L2 采集性能基准测试
  *
@@ -55,8 +60,8 @@ static int xioctl(int fd, int request, void *arg)
  * V4L2 缓冲区
  * -------------------------------------------------------------------- */
 typedef struct {
-    void   *start;
-    size_t  length;
+    void   *start; /**< 基准测试 mmap 的采集内存首地址，cleanup 时 munmap，不是物理地址。 */
+    size_t  length; /**< QUERYBUF 报告的完整映射字节数，供 munmap 使用，不是本帧 bytesused。 */
 } v4l2_buffer_t;
 
 static v4l2_buffer_t g_buffers[BUFFER_COUNT];

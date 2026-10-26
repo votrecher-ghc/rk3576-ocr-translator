@@ -3,6 +3,9 @@
 /**
  * @file v4l2_dmabuf.h
  * @brief V4L2 DMA-BUF 导出（VIDIOC_EXPBUF）
+ *
+ * 为已有 V4L2 MMAP 缓冲导出共享 fd；导出操作不分配另一幅图像，也不等待采集完成。
+ * 使用方仍须遵守 DQBUF/QBUF 时序；成功返回的 fd 需要由调用方或接管它的缓冲池关闭。
  */
 
 #include <stdint.h>

@@ -1,6 +1,9 @@
 /**
  * @file pose_history.c
  * @brief 时间戳姿态环形缓冲与四元数 SLERP。
+ *
+ * 按严格递增的纳秒时间戳保存姿态，用图像采集时刻查询对应四元数。
+ * 区间内使用 SLERP 插值，超出已有时间范围时取最近端点；调用方负责串行访问历史数据。
  */
 #include "pose_history.h"
 
@@ -38,6 +41,7 @@ static const ocr_pose_sample_t *sample_at(const ocr_pose_history_t *history,
     return &history->samples[physical_index(history, logical_index)];
 }
 
+/** @brief 四元数球面插值；点积为负时翻转终点，选择最短旋转弧，近重合时使用线性近似。 */
 static int slerp(const quaternion_t *a, const quaternion_t *b,
                  float ratio, quaternion_t *out)
 {
@@ -45,6 +49,8 @@ static int slerp(const quaternion_t *a, const quaternion_t *b,
     float dot = a->w * b->w + a->x * b->x +
                 a->y * b->y + a->z * b->z;
 
+    /* q 与 -q 表示同一姿态。把点积调为非负可沿最短球面弧插值，
+     * 防止相邻样本仅因四元数符号不同就产生一整圈的虚假旋转。 */
     if (dot < 0.0f) {
         dot = -dot;
         end.w = -end.w;
@@ -54,6 +60,7 @@ static int slerp(const quaternion_t *a, const quaternion_t *b,
     }
     if (dot > 1.0f) dot = 1.0f;
 
+    /* 几乎重合时 sin(theta) 太小，球面公式数值不稳；线性混合后归一化即可。 */
     if (dot > 0.9995f) {
         out->w = a->w + ratio * (end.w - a->w);
         out->x = a->x + ratio * (end.x - a->x);
@@ -91,6 +98,7 @@ void ocr_pose_history_reset(ocr_pose_history_t *history)
     ocr_pose_history_init(history);
 }
 
+/** @brief 只接受递增时间戳并归一化四元数；历史满时覆盖最旧样本。 */
 int ocr_pose_history_push(ocr_pose_history_t *history,
                           int64_t timestamp_ns,
                           const quaternion_t *q)
@@ -121,6 +129,7 @@ int ocr_pose_history_push(ocr_pose_history_t *history,
     return 0;
 }
 
+/** @brief 二分定位包围目标时间的样本并插值，超出历史范围时返回最近端点。 */
 int ocr_pose_history_sample(const ocr_pose_history_t *history,
                             int64_t timestamp_ns,
                             quaternion_t *q)
@@ -144,6 +153,8 @@ int ocr_pose_history_sample(const ocr_pose_history_t *history,
         return 0;
     }
 
+    /* logical index 0 始终表示最旧样本，sample_at 再映射到环形数组的物理位置。
+     * 时间严格递增保证二分有效，退出时 high/low 正好夹住图像查询时刻。 */
     low = 0;
     high = history->count - 1U;
     while (high - low > 1U) {
@@ -161,6 +172,8 @@ int ocr_pose_history_sample(const ocr_pose_history_t *history,
         float ratio;
 
         if (span <= 0) return -2;
+        /* 先在 int64 中做时间差，再以 double 相除；不要先把纳秒绝对时间转成
+         * float，否则设备运行较久后相邻样本间的小时间差会被精度吞掉。 */
         ratio = (float)((double)(timestamp_ns - a->timestamp_ns) /
                         (double)span);
         if (ratio < 0.0f) ratio = 0.0f;

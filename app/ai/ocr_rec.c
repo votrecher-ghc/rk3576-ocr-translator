@@ -1,4 +1,8 @@
-/** @file ocr_rec.c @brief OCR recognition and UTF-8 CTC decoding. */
+/** @file ocr_rec.c @brief OCR recognition and UTF-8 CTC decoding.
+ *
+ * 文字识别流程：按检测框四点采样 -> CPU 准备张量 -> RKNN 推理 -> CTC 解码。
+ * 词表行号与输出类别必须匹配，初始化阶段确认 blank 类别，避免识别结果发生整体偏移。
+ */
 #include "ocr_rec.h"
 #include "image_preproc.h"
 #include "log.h"
@@ -44,6 +48,7 @@ static int utf8_valid(const unsigned char *text, size_t length)
     return 1;
 }
 
+/** @brief 逐行加载 UTF-8 词表，类别映射与词表顺序保持一致。 */
 static int load_vocab(const char *path,
                       char (**vocab)[OCR_REC_MAX_TOKEN_LEN], int *vocab_len)
 {
@@ -143,11 +148,14 @@ static int image_tensor_shape(const ocr_rknn_tensor_t *attr,
          ? 0 : -EINVAL;
 }
 
+/** @brief 检查输出类别数和词表，确定 blank 的位置及词表索引偏移。 */
 static int configure_ctc_contract(ocr_rec_t *rec)
 {
     const ocr_rknn_tensor_t *output = &rec->rknn.outputs[0];
     if (output->n_dims < 2 || output->dims[0] != 1) return -EINVAL;
 
+    /* 约定类别在最后一维，例如 [1,T,C]；每个时间步都有 C 个类别分数。
+     * n_elems/C 推出 T；无法整除则不允许把内存强行解释为 CTC 分数表。 */
     uint32_t classes = output->dims[output->n_dims - 1u];
     if (classes == 0 || output->n_elems % classes != 0) return -EINVAL;
     rec->vocab_size = (int)classes;
@@ -160,7 +168,8 @@ static int configure_ctc_contract(ocr_rec_t *rec)
         if (strcmp(rec->vocab[i], " ") == 0) explicit_space = i;
     }
 
-    /* PaddleOCR commonly keeps blank and the optional space outside the file. */
+    /* 某些 PaddleOCR 词表文件不含 blank 和空格：C=文件行数+2 时，先补一个
+     * 空格到词表尾部，再由下一个分支把 blank 放在类别 0，避免所有类别错位。 */
     if (classes == (uint32_t)rec->vocab_len + 2u &&
         explicit_blank < 0 && explicit_space < 0) {
         void *new_vocab = realloc(
@@ -175,6 +184,7 @@ static int configure_ctc_contract(ocr_rec_t *rec)
 
     if (classes == (uint32_t)rec->vocab_len + 1u && explicit_blank < 0) {
         rec->blank_id = 0;
+        /* 类别 0 为 blank，不在词表中；类别 1 对应 vocab[0]，所以索引减一。 */
         rec->class_to_vocab_offset = -1;
         return 0;
     }
@@ -245,12 +255,15 @@ fail:
     return ret;
 }
 
+/** @brief 按四点文本框采样出识别输入图像，并按模型布局准备连续张量。 */
 static int preprocess(ocr_rec_t *rec, const ocr_buffer_t *buf,
                       const ocr_text_box_t *box, const void **input,
                       uint32_t *input_size, rknn_tensor_type *input_type,
                       rknn_tensor_format *input_fmt)
 {
     size_t pixels = (size_t)rec->input_w * (size_t)rec->input_h;
+    /* 检测得到的是四个角，不只是一块轴对齐矩形；透视采样把倾斜文字展开到
+     * 模型固定输入尺寸。读取源图 mmap_addr，在 CPU 中生成独立的 RGB 张量。 */
     int ret = ocr_ai_warp_quad_rgb(buf, box, rec->resize_buf,
                                    rec->input_w, rec->input_h);
     if (ret != 0) {
@@ -270,6 +283,8 @@ static int preprocess(ocr_rec_t *rec, const ocr_buffer_t *buf,
     for (size_t i = 0; i < pixels; ++i) {
         for (int channel = 0; channel < 3; ++channel) {
             float value = rec->resize_buf[i * 3u + (size_t)channel] / 255.0f;
+            /* 识别模型浮点约定：先除 255，再从 [0,1] 映射到 [-1,1]，
+             * 并按 CHW 排列；它与检测模型的逐通道 mean/std 不是同一个公式。 */
             rec->pre_buf[(size_t)channel * pixels + i] = (value - 0.5f) / 0.5f;
         }
     }
@@ -280,6 +295,7 @@ static int preprocess(ocr_rec_t *rec, const ocr_buffer_t *buf,
     return 0;
 }
 
+/** @brief 逐时间步选择最大类别，折叠连续重复并跳过 blank，再按词表拼接 UTF-8。 */
 static int ctc_decode(const float *output, int timesteps, int classes,
                       int blank_id, int class_to_vocab_offset,
                       char (*vocab)[OCR_REC_MAX_TOKEN_LEN], int vocab_len,
@@ -299,8 +315,11 @@ static int ctc_decode(const float *output, int timesteps, int classes,
                 best = cls;
             }
         }
+        /* 只在有限分数中做 argmax，若整步都是 NaN/Inf 则报错，不能把默认类别
+         * 当作识别成功。argmax 不需要先 softmax，单调转换不改变最大项的位置。 */
         if (best < 0) return -EDOM;
 
+        /* CTC 先折叠相邻重复，再移除 blank：A,A,blank,A 应还原成 AA。 */
         if (best != blank_id && best != previous) {
             int vocab_id = best + class_to_vocab_offset;
             if (vocab_id < 0 || vocab_id >= vocab_len) return -ERANGE;
@@ -310,6 +329,8 @@ static int ctc_decode(const float *output, int timesteps, int classes,
             pos += (int)token_len;
             text[pos] = '\0';
         }
+        /* blank 也更新 previous，才能允许 A,blank,A 还原成两个 A。
+         * 若只记上次输出字符而忽略 blank，会错误吞掉被 blank 分开的重复字。 */
         previous = best;
     }
     return pos;
@@ -350,6 +371,7 @@ int ocr_rec_run(ocr_rec_t *rec, const ocr_buffer_t *buf,
     return ret < 0 ? ret : 0;
 }
 
+/** @brief 顺序识别各文本框，复用单个模型上下文和工作区；此处 batch 不是并行推理。 */
 int ocr_rec_run_batch(ocr_rec_t *rec, const ocr_buffer_t *buf,
                       const ocr_text_box_list_t *boxes, char **texts)
 {

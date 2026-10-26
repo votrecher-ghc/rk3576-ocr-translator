@@ -1,6 +1,9 @@
 /**
  * @file ringbuffer.c
  * @brief 无锁 SPSC 环形缓冲实现
+ *
+ * 固定元素大小的单生产者/单消费者队列；push/pop 拷贝元素内容，不接管元素内指针的资源。
+ * 生产者先写数据再 release 发布 head，消费者 acquire 观察 head 后读取；容量满时返回 1。
  */
 #include "ringbuffer.h"
 #include "log.h"
@@ -48,11 +51,13 @@ void ocr_ringbuffer_destroy(ocr_ringbuffer_t *rb)
     atomic_store_explicit(&rb->tail, 0, memory_order_relaxed);
 }
 
+/** @brief 逻辑序号以 size_t 递增；容量为二次幂时用位掩码，否则用取模映射到存储槽。 */
 static size_t rb_index(const ocr_ringbuffer_t *rb, size_t pos)
 {
     return rb->mask ? (pos & rb->mask) : (pos % rb->count);
 }
 
+/** @brief 生产者先确认空位，复制元素后 release 发布 head，不能被多个生产者并发调用。 */
 int ocr_ringbuffer_push(ocr_ringbuffer_t *rb, const void *elem)
 {
     if (!rb || !elem || !rb->buf || rb->count == 0) return -1;
@@ -65,11 +70,14 @@ int ocr_ringbuffer_push(ocr_ringbuffer_t *rb, const void *elem)
         return 1;
     }
 
+    /* 先写槽内数据，再 release 发布 head；消费者 acquire 看到新 head 后，
+     * 才能保证也看见该槽的数据。只把 head 声明 volatile 不能提供这种顺序。 */
     memcpy(rb->buf + rb_index(rb, head) * rb->elem_size, elem, rb->elem_size);
     atomic_store_explicit(&rb->head, head + 1, memory_order_release);
     return 0;
 }
 
+/** @brief 消费者 acquire 观察 head 后读取元素，再发布 tail 允许生产者复用该槽。 */
 int ocr_ringbuffer_pop(ocr_ringbuffer_t *rb, void *elem)
 {
     if (!rb || !elem || !rb->buf || rb->count == 0) return -1;
@@ -83,6 +91,8 @@ int ocr_ringbuffer_pop(ocr_ringbuffer_t *rb, void *elem)
     }
 
     memcpy(elem, rb->buf + rb_index(rb, tail) * rb->elem_size, rb->elem_size);
+    /* 复制完成才允许生产者复用该槽，生产者 acquire 读取 tail 与此配对。
+     * elem 内若有指针，memcpy 只复制地址，不增加对应对象的任何引用。 */
     atomic_store_explicit(&rb->tail, tail + 1, memory_order_release);
     return 0;
 }

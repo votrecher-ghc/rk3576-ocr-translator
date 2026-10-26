@@ -1,6 +1,9 @@
 /**
  * @file fan_ctrl.c
  * @brief 风扇调速实现
+ *
+ * 用户态 PWM 风扇控制：识别 PWM 通道、独占控制权、设置周期/占空比，并按温度回差调速。
+ * 记录 PWM 的来源和初始状态，退出时只释放自己导出的通道，借用的通道则恢复原配置。
  */
 #include "fan_ctrl.h"
 #include "log.h"
@@ -27,6 +30,7 @@ static void reset_controller(ocr_fan_ctrl_t *ctrl)
     ctrl->lock_fd = -1;
 }
 
+/** @brief 取得进程间控制锁，防止两个用户态控制器同时改写同一 PWM。 */
 static int acquire_fan_lock(ocr_fan_ctrl_t *ctrl)
 {
     int fd;
@@ -92,6 +96,7 @@ static int is_pwmchip_name(const char *name)
     return 1;
 }
 
+/** @brief 按风扇标记寻找 PWM 提供者，避免依赖探测顺序决定的 pwmchip 编号。 */
 static int find_marked_fan_pwm(char *path, size_t path_size)
 {
     DIR *directory;
@@ -233,6 +238,7 @@ static int parse_pwm_location(ocr_fan_ctrl_t *ctrl)
     return 0;
 }
 
+/** @brief 确保目标 PWM 已导出并记录是否由本控制器创建，便于退出时正确回收。 */
 static int ensure_pwm_exported(ocr_fan_ctrl_t *ctrl)
 {
     char path[256];
@@ -285,6 +291,7 @@ static int disable_pwm(const ocr_fan_ctrl_t *ctrl)
     return ret;
 }
 
+/** @brief 保存借用 PWM 的初始状态，退出时按该状态恢复而不是直接 unexport。 */
 static int capture_external_state(ocr_fan_ctrl_t *ctrl)
 {
     int enable, period, duty;
@@ -303,6 +310,7 @@ static int capture_external_state(ocr_fan_ctrl_t *ctrl)
     return 0;
 }
 
+/** @brief 恢复外部拥有的 PWM 状态，调整周期与占空比时遵守 sysfs 约束。 */
 static int restore_external_state(ocr_fan_ctrl_t *ctrl)
 {
     int ret = 0;
@@ -352,7 +360,8 @@ int ocr_fan_ctrl_init(ocr_fan_ctrl_t *ctrl, const char *pwm_path)
     reset_controller(ctrl);
     ctrl->auto_mode = is_auto;
 
-    /* No PWM sysfs discovery or mutation is allowed before this lock. */
+    /* 用户态控制器先持有进程间锁再枚举/修改 PWM，保证导出、保存初态和接管
+     * 属于一次连续操作。内核自动温控模式由 main 选择，不进入此用户态接管路径。 */
     if (acquire_fan_lock(ctrl) != 0)
         return finish_init_failure(ctrl, -2);
 
@@ -402,7 +411,9 @@ int ocr_fan_ctrl_init(ocr_fan_ctrl_t *ctrl, const char *pwm_path)
     ctrl->threshold_down[2] = 62000;
     ctrl->threshold_down[3] = 72000;
 
-    /* 启用 PWM 输出 */
+    /* 先停输出、把 duty 清零再改 period，避免旧 duty 大于新 period 而被 sysfs 拒绝。
+     * 多次 sysfs 写入不是原子事务，任一步失败都要根据所有权恢复外部初态，
+     * 或禁用并撤销本进程自己导出的通道；回滚失败则保留锁供后续清理重试。 */
     if (write_attribute(ctrl, "enable", 0) != 0 ||
         write_attribute(ctrl, "duty_cycle", 0) != 0 ||
         write_attribute(ctrl, "period", ctrl->period_ns) != 0 ||
@@ -427,13 +438,16 @@ int ocr_fan_ctrl_init(ocr_fan_ctrl_t *ctrl, const char *pwm_path)
     return 0;
 }
 
+/** @brief 按温度阈值和回差决定档位，避免临界温度附近反复切换转速。 */
 int ocr_fan_ctrl_update(ocr_fan_ctrl_t *ctrl, int temp_mdeg)
 {
     if (!ctrl || !ctrl->initialized || !ctrl->lock_held) return -1;
 
     int new_level = ctrl->cur_level;
 
-    /* 状态机：根据温度升降等级 */
+    /* while 允许温度突变时一次跨多档，不能用单个 if 只升/降一级。
+     * 升档看 threshold_up，降档看 threshold_down：例如 45°C 升到 1 档后，
+     * 温度降到 44°C 仍保持 1 档，低于 42°C 才降，避免临界点反复开关风扇。 */
     while (new_level < FAN_MAX_LEVEL && temp_mdeg >= ctrl->threshold_up[new_level])
         new_level++;
     while (new_level > 0 && temp_mdeg < ctrl->threshold_down[new_level - 1])
@@ -459,11 +473,13 @@ int ocr_fan_ctrl_set_level(ocr_fan_ctrl_t *ctrl, int level)
         LOG_W("写入风扇占空比失败: %s/duty_cycle", ctrl->pwm_path);
         return -2;
     }
+    /* 仅在硬件写入成功后提交软件状态，失败时 cur_level 保持原值供下一轮重试。 */
     ctrl->cur_level = level;
     ctrl->cur_duty_ns = duty;
     return 0;
 }
 
+/** @brief 释放自有 PWM 或恢复借用 PWM，再释放独占锁。 */
 int ocr_fan_ctrl_destroy(ocr_fan_ctrl_t *ctrl)
 {
     if (!ctrl) return -1;

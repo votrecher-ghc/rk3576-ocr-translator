@@ -1,6 +1,9 @@
 /**
  * @file attitude_fusion.c
  * @brief 带数值保护、启动零偏校准和安装矩阵的六轴 Madgwick 融合。
+ *
+ * 六轴姿态融合：把 IMU 轴转换到摄像头坐标系，估计启动静止零偏，再积分更新四元数。
+ * 加速度使用 m/s²，角速度使用 rad/s，dt 使用秒；欧拉角输出使用度，异常大时间间隔会被拒绝。
  */
 #include "attitude_fusion.h"
 #include "math_utils.h"
@@ -68,6 +71,7 @@ static void transform_vector(const float matrix[9], const float input[3],
                 matrix[8] * input[2];
 }
 
+/** @brief 检查安装矩阵近似正交且为合法旋转，避免轴变换引入缩放或反射。 */
 static int validate_mount_matrix(const float matrix[9])
 {
     float row_norm[3];
@@ -135,6 +139,7 @@ int ocr_attitude_set_mount_matrix(ocr_attitude_t *att,
     return 0;
 }
 
+/** @brief 仅在近似静止时累积启动零偏，检测到运动则清空当前校准窗口。 */
 static void update_gyro_bias(ocr_attitude_t *att, const float accel[3],
                              const float gyro[3], float dt)
 {
@@ -160,6 +165,8 @@ static void update_gyro_bias(ocr_attitude_t *att, const float accel[3],
     att->gyro_bias_elapsed += dt;
     ++att->gyro_bias_samples;
 
+    /* 同时要求静止持续时间和样本数，避免低采样率下只凭少量点就宣布零偏有效。
+     * 运动时上面的分支重置整个累计窗口，最终平均值对应连续静止的一段数据。 */
     if (att->gyro_bias_elapsed >= OCR_ATTITUDE_BIAS_SECONDS &&
         att->gyro_bias_samples >= OCR_ATTITUDE_BIAS_MIN_SAMPLES) {
         float count = (float)att->gyro_bias_samples;
@@ -186,6 +193,7 @@ static void correct_gyro(const ocr_attitude_t *att, const float gyro[3],
         corrected[axis] = gyro[axis] - provisional_bias[axis];
 }
 
+/** @brief 由角速度计算四元数导数，再用重力方向的梯度修正抑制倾斜漂移。 */
 static int attitude_step(ocr_attitude_t *att, const float accel[3],
                          const float gyro[3], float dt)
 {
@@ -196,6 +204,8 @@ static int attitude_step(ocr_attitude_t *att, const float accel[3],
     float gx = gyro[0];
     float gy = gyro[1];
     float gz = gyro[2];
+    /* 四元数运动学 q_dot = 0.5 * q 乘角速度四元数；gyro 必须为 rad/s。
+     * 后面再叠加加速度方向的梯度修正，beta 控制倾斜校正力度。 */
     float q_dot0 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
     float q_dot1 = 0.5f * ( q0 * gx + q2 * gz - q3 * gy);
     float q_dot2 = 0.5f * ( q0 * gy - q1 * gz + q3 * gx);
@@ -241,6 +251,8 @@ static int attitude_step(ocr_attitude_t *att, const float accel[3],
         }
     }
 
+    /* 对导数按秒积分，再单位化消除数值误差。六轴重力只约束倾斜方向，
+     * 没有磁场等绝对朝向输入，绕重力轴的航向仍可能随时间漂移。 */
     att->q.w = q0 + q_dot0 * dt;
     att->q.x = q1 + q_dot1 * dt;
     att->q.y = q2 + q_dot2 * dt;
@@ -248,6 +260,7 @@ static int attitude_step(ocr_attitude_t *att, const float accel[3],
     return quaternion_normalize(&att->q);
 }
 
+/** @brief 校验时间间隔、转换坐标并去零偏，将较大 dt 分成若干小步积分。 */
 int ocr_attitude_update(ocr_attitude_t *att, const float accel[3],
                         const float gyro[3], float dt)
 {
@@ -272,11 +285,15 @@ int ocr_attitude_update(ocr_attitude_t *att, const float accel[3],
         return -3;
     }
 
+    /* 两种传感器都先旋转到摄像头坐标，再在同一坐标系估计/扣除零偏。
+     * 只对 gyro 转轴而不对 accel 转轴，会把重力修正施加到错误方向。 */
     transform_vector(att->mount_matrix, accel, accel_camera);
     transform_vector(att->mount_matrix, gyro, gyro_camera);
     update_gyro_bias(att, accel_camera, gyro_camera, dt);
     correct_gyro(att, gyro_camera, gyro_corrected);
 
+    /* 把较长但仍合法的 dt 拆成接近名义采样周期的小步，降低一次欧拉积分误差。
+     * 小步复用同一采样值，并不是凭空恢复丢失样本；max_dt 已拒绝过长空档。 */
     steps = (int)ceilf(dt / att->sample_dt);
     if (steps < 1) steps = 1;
     if (steps > OCR_ATTITUDE_MAX_STEPS) steps = OCR_ATTITUDE_MAX_STEPS;
@@ -290,6 +307,7 @@ int ocr_attitude_update(ocr_attitude_t *att, const float accel[3],
     return 0;
 }
 
+/** @brief 保留九轴调用入口；当前实际沿用六轴更新，磁力计没有参与修正。 */
 int ocr_attitude_update_9dof(ocr_attitude_t *att, const float accel[3],
                              const float gyro[3], const float mag[3], float dt)
 {

@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
+/**
+ * @file iio_adt7410.c
+ * ADT7410 温度驱动：I2C 直接传输读写寄存器，配置 16 位连续采样并注册 IIO 温度通道。
+ * 原始温度是有符号数，scale 为每计数 7.8125 毫摄氏度；寄存器访问统一由 mutex 串行化。
+ */
 /*
  * ADT7410 high-accuracy digital temperature sensor driver
  *
@@ -52,16 +57,17 @@
 #define ADT7410_READY_RETRY_DELAY_MS          60
 
 struct adt7410_data {
-	struct i2c_client *client;
-	struct mutex lock;
-	u8 original_config;
-	u8 active_config;
+	struct i2c_client *client; /**< 借用 I2C core 管理的客户端设备，提供适配器/地址；驱动不自行 free。 */
+	struct mutex lock; /**< 串行化寄存器访问、等待转换和电源配置；后缀 locked 的辅助函数要求调用方持锁。 */
+	u8 original_config; /**< 探测时保存的芯片配置寄存器值，卸载/回滚时用于恢复。 */
+	u8 active_config; /**< 本驱动正常采样所需配置，恢复运行时重写；与接管前 original_config 区分。 */
 };
 
 /*
  * The caller serializes access with data->lock. Reads use a write message for
  * the register address followed by a repeated-start read message.
  */
+/* 调用者持有 data->lock；先写寄存器地址，再 repeated-start 读取一个字节。 */
 static int adt7410_read_reg_locked(struct adt7410_data *data, u8 reg, u8 *value)
 {
 	struct i2c_client *client = data->client;
@@ -148,6 +154,7 @@ static int adt7410_read_be16_locked(struct adt7410_data *data,
 	return 0;
 }
 
+/* 轮询转换就绪标记，超过重试上限返回超时，避免把未完成转换当成温度。 */
 static int adt7410_wait_ready_locked(struct adt7410_data *data)
 {
 	u8 status;
@@ -168,6 +175,7 @@ static int adt7410_wait_ready_locked(struct adt7410_data *data)
 	return -ETIMEDOUT;
 }
 
+/* 确认转换完成后读取大端 16 位温度，并转换为有符号原始计数。 */
 static int adt7410_read_temperature_locked(struct adt7410_data *data,
 					   int *value)
 {
@@ -182,10 +190,13 @@ static int adt7410_read_temperature_locked(struct adt7410_data *data,
 	if (ret)
 		return ret;
 
+	/* 转为 s16 保留负温度的补码符号，再提升到 int；直接赋 u16 会把负温度
+	 * 错认成大正数。此处返回计数，不直接返回摄氏度或毫摄氏度。 */
 	*value = (s16)raw;
 	return 0;
 }
 
+/* 向 IIO 提供 raw/scale，温度换算由 IIO 消费者按统一单位完成。 */
 static int adt7410_read_raw(struct iio_dev *indio_dev,
 			    const struct iio_chan_spec *chan,
 			    int *val, int *val2, long mask)
@@ -207,6 +218,8 @@ static int adt7410_read_raw(struct iio_dev *indio_dev,
 		return IIO_VAL_INT;
 
 	case IIO_CHAN_INFO_SCALE:
+		/* IIO_VAL_INT_PLUS_MICRO: val + val2/1e6 = 7.8125 m°C/计数。
+		 * 因而 raw=128 对应 1000 m°C，也就是 1°C；用户态不应再重复乘 1000。 */
 		*val = ADT7410_SCALE_MILLI_INT;
 		*val2 = ADT7410_SCALE_MILLI_MICRO;
 		return IIO_VAL_INT_PLUS_MICRO;
@@ -242,6 +255,7 @@ static void adt7410_restore_config(void *private)
 	mutex_unlock(&data->lock);
 }
 
+/* 核对芯片身份、保存原始配置，再启用所需温度转换模式。 */
 static int adt7410_chip_init(struct adt7410_data *data)
 {
 	u8 value;

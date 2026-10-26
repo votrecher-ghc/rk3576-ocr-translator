@@ -1,6 +1,9 @@
 /**
  * @file storage_mgr.c
  * @brief 存储管理实现
+ *
+ * 存储容量管理：读取文件系统使用率，按日期顺序清理归档直到达到目标占用率。
+ * 递归删除通过目录 fd 定位并拒绝跟随符号链接，清理范围限定为识别出的日期归档目录。
  */
 #include "storage_mgr.h"
 #include "log.h"
@@ -51,14 +54,19 @@ int ocr_storage_mgr_check(ocr_storage_mgr_t *mgr, int *used_percent)
  * already-open parent directory. O_NOFOLLOW closes the lstat/open race for
  * directory entries; unlinkat keeps every mutation anchored to a directory fd.
  */
+/** @brief 相对父目录 fd 递归清理条目，不跟随符号链接进入其他目录。 */
 static int remove_dir_recursive_at(int parent_fd, const char *name)
 {
     if (parent_fd < 0 || !name || !*name || strchr(name, '/')) return -1;
 
+    /* 只接受单个子项名称，且相对已打开的父目录定位；不能用任意拼接路径。
+     * O_NOFOLLOW 防止条目被替换成符号链接后递归跑到归档树之外。 */
     int child_fd = openat(parent_fd, name,
                           O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (child_fd < 0) return -1;
 
+    /* fdopendir 成功就接管 child_fd，后面 closedir 会连同 fd 一起关闭；
+     * 失败未接管，才由此函数自己 close，不能两条路径都重复关闭同一描述符。 */
     DIR *d = fdopendir(child_fd);
     if (!d) {
         int saved_errno = errno;
@@ -115,6 +123,7 @@ static int name_compare(const void *a, const void *b)
     return strcmp(*(const char **)a, *(const char **)b);
 }
 
+/** @brief 只接受预期日期命名的归档目录，避免清理无关文件。 */
 static int is_archive_date_dir(const char *name)
 {
     if (!name || strlen(name) != 8) return 0;
@@ -124,6 +133,7 @@ static int is_archive_date_dir(const char *name)
     return 1;
 }
 
+/** @brief 从最旧日期开始回收归档，每次重新检查容量，达到目标占用率后停止。 */
 int ocr_storage_mgr_cleanup(ocr_storage_mgr_t *mgr, int target_percent)
 {
     if (!mgr || target_percent < 0 || target_percent >= 100) return -1;
@@ -163,7 +173,8 @@ int ocr_storage_mgr_cleanup(ocr_storage_mgr_t *mgr, int target_percent)
     }
     struct dirent *ent;
     while ((ent = readdir(d))) {
-        /* The capture thread may be writing today's directory concurrently. */
+        /* 当天目录可能仍被按键拍照会话写入，跳过整个当天，避免删除半份归档。
+         * 只有 8 位日期目录进入候选集，普通文件或符号链接不会被当作日期目录递归。 */
         if (!is_archive_date_dir(ent->d_name) ||
             (today[0] && strcmp(ent->d_name, today) == 0)) continue;
         struct stat st;

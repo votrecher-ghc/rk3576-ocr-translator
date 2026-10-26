@@ -1,6 +1,9 @@
 /**
  * @file drm_device.c
  * @brief DRM 设备、connector、encoder 与 CRTC 选择
+ *
+ * DRM 设备与显示模式管理：发现已连接 connector、匹配 encoder/CRTC，并保存原有显示状态。
+ * 首帧通过 modeset 建立扫描输出；退出时尽可能恢复原显示配置，再释放查询得到的 DRM 对象。
  */
 #include "drm_device.h"
 #include "log.h"
@@ -169,6 +172,7 @@ static int choose_mode(const drmModeConnector *conn,
     return 0;
 }
 
+/** @brief 打开 DRM 节点、核对 KMS 能力并查询资源；显示连接及模式由 setup 阶段选择。 */
 int ocr_drm_open(ocr_drm_device_t *dev, const char *dev_path)
 {
     if (!dev || !dev_path || dev_path[0] == '\0') return -1;
@@ -209,6 +213,7 @@ int ocr_drm_open(ocr_drm_device_t *dev, const char *dev_path)
     return 0;
 }
 
+/** @brief 根据目标分辨率选择显示模式，为首帧 modeset 准备 CRTC。 */
 int ocr_drm_setup_crtc_mode(ocr_drm_device_t *dev,
                             uint32_t desired_width, uint32_t desired_height)
 {
@@ -320,6 +325,7 @@ int ocr_drm_setup_crtc(ocr_drm_device_t *dev)
     return ocr_drm_setup_crtc_mode(dev, 0, 0);
 }
 
+/** @brief 把首帧 framebuffer 绑定到选定 CRTC，成功后记录显示已经启用。 */
 int ocr_drm_modeset(ocr_drm_device_t *dev, uint32_t fb_id)
 {
     if (!dev || !dev->opened || dev->fd < 0 || !dev->connector ||
@@ -340,6 +346,7 @@ int ocr_drm_modeset(ocr_drm_device_t *dev, uint32_t fb_id)
     return 0;
 }
 
+/** @brief 恢复显示状态并释放 DRM 资源；调用前应先销毁依赖此设备的 sink 和 overlay。 */
 void ocr_drm_close(ocr_drm_device_t *dev)
 {
     if (!dev) return;

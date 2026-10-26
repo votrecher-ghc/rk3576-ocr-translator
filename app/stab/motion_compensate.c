@@ -1,6 +1,9 @@
 /**
  * @file motion_compensate.c
  * @brief 平滑目标姿态到固定裁剪窗口偏移的转换。
+ *
+ * 平滑虚拟摄像机姿态与当前姿态之差，通过视场角换算成像素位移，限制在裁剪余量内。
+ * scale 保持固定以避免画面呼吸；当前仅输出平移补偿，绕光轴的小角度旋转不进入 RGA 执行路径。
  */
 #include "motion_compensate.h"
 #include "math_utils.h"
@@ -20,12 +23,14 @@ static float wrap_degrees(float angle)
     return wrapped - 180.0f;
 }
 
+/** @brief 先把角度差折回最短方向，再低通跟随，防止跨越 ±180 度时产生大幅跳变。 */
 static float follow_angle(float smooth, float current, float alpha)
 {
     float error = wrap_degrees(current - smooth);
     return wrap_degrees(smooth + alpha * error);
 }
 
+/** @brief 通过视场角和图像尺寸估计像素焦距，把姿态误差换算为图像平移。 */
 static float focal_length_pixels(uint32_t image_size, float fov_deg)
 {
     float half_fov = 0.5f * fov_deg * OCR_MOTION_DEG_TO_RAD;
@@ -54,6 +59,7 @@ int ocr_motion_comp_init(ocr_motion_comp_t *mc, float hfov, float vfov,
     return 0;
 }
 
+/** @brief 计算真实姿态与平滑姿态的差，再按固定裁剪余量限制水平和垂直补偿。 */
 int ocr_motion_comp_update(ocr_motion_comp_t *mc, const ocr_attitude_t *att,
                            uint32_t img_w, uint32_t img_h,
                            ocr_stab_params_t *params)
@@ -94,6 +100,8 @@ int ocr_motion_comp_update(ocr_motion_comp_t *mc, const ocr_attitude_t *att,
     memset(params, 0, sizeof(*params));
     params->scale = mc->max_scale;
 
+    /* 首帧直接把虚拟姿态设为当前姿态，不产生位移；否则默认全零姿态会让启动
+     * 时的任意安装角度被误当成突然抖动，画面立即偏向裁剪边缘。 */
     if (!mc->initialized) {
         mc->smooth_euler = current;
         mc->initialized = 1;
@@ -134,6 +142,8 @@ int ocr_motion_comp_update(ocr_motion_comp_t *mc, const ocr_attitude_t *att,
     crop_margin_x = 0.5f * ((float)img_w - crop_w);
     crop_margin_y = 0.5f * ((float)img_h - crop_h);
 
+    /* 两种上限取较小值：配置允许的最大移动，以及固定缩放后真实剩余的边缘。
+     * 例如 scale=1 时没有裁剪余量，即使 max_shift_ratio>0 也必须输出零位移。 */
     max_dx = fminf((float)img_w * mc->max_shift_ratio, crop_margin_x);
     max_dy = fminf((float)img_h * mc->max_shift_ratio, crop_margin_y);
     params->dx = ocr_clamp_f(dx, -max_dx, max_dx);

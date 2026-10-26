@@ -3,6 +3,9 @@
 /**
  * @file drm_device.h
  * @brief DRM 设备管理：open/resources/crtc/connector
+ *
+ * DRM 设备与显示模式管理：发现已连接 connector、匹配 encoder/CRTC，并保存原有显示状态。
+ * 首帧通过 modeset 建立扫描输出；退出时尽可能恢复原显示配置，再释放查询得到的 DRM 对象。
  */
 
 #include <stdint.h>
@@ -13,24 +16,24 @@
 
 /** DRM 设备上下文 */
 typedef struct {
-    int              fd;          /* DRM 设备 fd */
-    drmModeRes      *res;         /* DRM 资源 */
-    drmModeConnector *connector;  /* 当前连接器 */
-    drmModeCrtc     *crtc;        /* 打开时的 CRTC 状态（关闭时用于恢复） */
-    drmModeModeInfo  mode;        /* 选中的显示模式 */
-    uint32_t         connector_id;/* 选中的 connector ID */
-    uint32_t         crtc_id;     /* 选中的 CRTC ID */
-    uint32_t         original_connector_crtc_id; /* connector 打开前所连 CRTC */
-    uint32_t         routed_connectors[OCR_DRM_MAX_CONNECTORS];
-    int              routed_connector_count; /* 打开时路由到选中 CRTC 的 connector */
-    int              crtc_index;  /* CRTC 在 drmModeRes.crtcs 中的索引 */
-    uint32_t         width;       /* 显示宽度 */
-    uint32_t         height;      /* 显示高度 */
-    uint32_t         refresh;     /* 刷新率（mHz） */
-    int              mode_set;    /* 选中 CRTC 当前是否处于 active scanout */
-    int              restore_needed; /* 关闭时是否需要恢复打开前状态 */
-    int              universal_planes; /* 是否成功启用 universal planes */
-    int              opened;      /* 设备 fd/资源生命周期已建立 */
+    int              fd; /**< 本设备拥有的 DRM/KMS fd，open 创建、close 关闭；依赖它的 FB/plane 须先退出。 */
+    drmModeRes      *res; /**< drmModeGetResources 返回的资源快照，本模块负责 drmModeFreeResources。 */
+    drmModeConnector *connector; /**< 模式协商选中的已连接 connector 查询对象，本模块负责释放。 */
+    drmModeCrtc     *crtc; /**< 选定 CRTC 在接管前的状态快照，供 close 恢复，不是每帧实时查询结果。 */
+    drmModeModeInfo  mode; /**< 选择的显示时序值副本，首帧 modeset 使用；包含尺寸及刷新时序。 */
+    uint32_t         connector_id; /**< 所选显示连接器的 KMS 对象 ID，不是资源数组下标。 */
+    uint32_t         crtc_id; /**< 所选扫描控制器 KMS 对象 ID，用于 modeset/pageflip/plane 绑定。 */
+    uint32_t         original_connector_crtc_id; /**< 接管前当前 connector 的路由 CRTC ID，用于判断和恢复原路由。 */
+    uint32_t         routed_connectors[OCR_DRM_MAX_CONNECTORS]; /**< 恢复/设置所选 CRTC 时使用的 connector ID 列表，前 routed_connector_count 项有效。 */
+    int              routed_connector_count; /**< routed_connectors 有效项数，不是系统所有 connector 数。 */
+    int              crtc_index; /**< crtc_id 在 res->crtcs 中的下标，用来解释 possible_crtcs 位图及 vblank 选择。 */
+    uint32_t         width; /**< 最终显示模式宽度，像素；输出池按此尺寸分配，不一定等于配置请求。 */
+    uint32_t         height; /**< 最终显示模式高度，像素；primary framebuffer 必须与其匹配。 */
+    uint32_t         refresh; /**< 记录的模式刷新率，毫赫兹；代码取 mode.vrefresh*1000。 */
+    int              mode_set; /**< 本模块已激活所选 CRTC 扫描时为 1；决定首帧 modeset 或后续 pageflip。 */
+    int              restore_needed; /**< 接管后需要在 close 恢复原显示状态的标记，与当前扫描是否启用区分。 */
+    int              universal_planes; /**< 成功请求 universal planes 的标记，决定能否统一枚举 primary/overlay 等层。 */
+    int              opened; /**< DRM fd 生命周期建立标志；不表示模式已选择或屏幕已开始显示。 */
 } ocr_drm_device_t;
 
 /**
@@ -47,11 +50,14 @@ int ocr_drm_open(ocr_drm_device_t *dev, const char *dev_path);
 void ocr_drm_close(ocr_drm_device_t *dev);
 
 /**
- * @brief 获取 CRTC 与连接器（选择已连接的第一个 connector）
+ * @brief 寻找同时具有可用显示模式和兼容 CRTC 的已连接 connector。
  */
 int ocr_drm_setup_crtc(ocr_drm_device_t *dev);
 
-/** Select a connector/CRTC mode matching the configured dimensions. */
+/** Select a connector/CRTC mode matching the configured dimensions.
+ *
+ * 根据目标分辨率选择显示模式，为首帧 modeset 准备 CRTC。
+ */
 int ocr_drm_setup_crtc_mode(ocr_drm_device_t *dev,
                             uint32_t width, uint32_t height);
 

@@ -1,3 +1,8 @@
+/**
+ * @file test_ocr_postproc.c
+ * 构造倾斜连通域概率图，验证后处理能够输出有方向的四点文本框。
+ * 使用合成输入直接调用后处理，不依赖真实 RKNN 模型推理。
+ */
 #include "ocr_postproc.h"
 
 #include <assert.h>

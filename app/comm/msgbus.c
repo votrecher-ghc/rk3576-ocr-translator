@@ -1,6 +1,9 @@
 /**
  * @file msgbus.c
- * @brief 消息总线实现（无锁环形缓冲 + eventfd）
+ * @brief 消息总线实现（生产者互斥锁 + SPSC 环形缓冲 + eventfd）
+ *
+ * 消息总线以环形队列保存消息，以 eventfd 唤醒单个消费者。
+ * 多个生产者由 producer_lock 串行化；eventfd 只是通知，消息内容始终以队列为准。
  */
 #include "msgbus.h"
 #include "ringbuffer.h"
@@ -15,8 +18,8 @@
 #include <pthread.h>
 
 typedef struct {
-    ocr_ringbuffer_t ring;
-    pthread_mutex_t  producer_lock;
+    ocr_ringbuffer_t ring; /**< 内嵌定长 ocr_msg_t 队列；仅值拷贝消息，不自动管理消息内指针的资源。 */
+    pthread_mutex_t  producer_lock; /**< 把多个 post 发送者串行化，满足底层 SPSC 单生产者约定。 */
 } ocr_msgbus_priv_t;
 
 static int msgbus_pop(ocr_msgbus_t *bus, ocr_msg_t *msg)
@@ -42,6 +45,8 @@ int ocr_msgbus_init(ocr_msgbus_t *bus, size_t capacity)
     bus->epoll_fd = -1;
 
     /* eventfd 用于唤醒消费者 */
+    /* SEMAPHORE 使每次 read 只消费一个通知计数，而非一次清空全部计数。
+     * NONBLOCK 允许队列已被直接取空后安全尝试消耗通知，不让消费者卡在 read。 */
     bus->eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK | EFD_SEMAPHORE);
     if (bus->eventfd < 0) {
         LOG_E("eventfd 创建失败: %s", strerror(errno));
@@ -89,11 +94,14 @@ void ocr_msgbus_destroy(ocr_msgbus_t *bus)
     }
 }
 
+/** @brief 在生产者锁内入队消息，成功后写 eventfd；队列满时不发布通知。 */
 int ocr_msgbus_post(ocr_msgbus_t *bus, const ocr_msg_t *msg)
 {
     if (!bus || !msg || !bus->running || !bus->ring || bus->eventfd < 0) return -1;
 
     ocr_msgbus_priv_t *priv = (ocr_msgbus_priv_t *)bus->ring;
+    /* 底层 ringbuffer 只支持单生产者；所有 post 在这里串行化后，才可对外
+     * 支持多个发送线程。接收端仍约定只有一个消费者，没有对 pop 另加接收锁。 */
     pthread_mutex_lock(&priv->producer_lock);
     int ret = ocr_ringbuffer_push(&priv->ring, msg);
     pthread_mutex_unlock(&priv->producer_lock);
@@ -109,11 +117,13 @@ int ocr_msgbus_post(ocr_msgbus_t *bus, const ocr_msg_t *msg)
     return 0;
 }
 
+/** @brief 先尝试出队，再按超时等待通知并重试；返回 1 表示当前无消息或等待超时。 */
 int ocr_msgbus_recv(ocr_msgbus_t *bus, ocr_msg_t *msg, int timeout_ms)
 {
     if (!bus || !msg || !bus->running || !bus->ring || bus->eventfd < 0) return -1;
 
-    /* 先尝试直接读 */
+    /* 队列是事实来源，eventfd 是唤醒线索。先出队可避免有现成消息仍进入 poll；
+     * 出队成功后也消耗对应通知，防止下次被过期计数不断唤醒。 */
     if (msgbus_pop(bus, msg) == 0) {
         msgbus_consume_signal(bus);
         return 0;
@@ -142,7 +152,8 @@ int ocr_msgbus_recv(ocr_msgbus_t *bus, ocr_msg_t *msg, int timeout_ms)
         msgbus_consume_signal(bus);
     }
 
-    /* 再次尝试取消息 */
+    /* 通知后仍需实际出队：不能把 eventfd 的整数当作消息或保证一次读取成功。
+     * 队列消息已经按 ocr_msg_t 值拷贝，里面若含外部指针，资源归属另由协议约定。 */
     if (msgbus_pop(bus, msg) == 0) {
         return 0;
     }

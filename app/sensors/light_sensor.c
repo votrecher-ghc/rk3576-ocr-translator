@@ -1,6 +1,9 @@
 /**
  * @file light_sensor.c
  * @brief AP3216C 环境光读取实现
+ *
+ * 读取 IIO 环境光数据，优先使用处理后的照度，必要时以 raw 和 scale 计算。
+ * 向上层统一返回整数 lux，屏蔽具体 IIO 设备编号和属性路径差异。
  */
 #include "light_sensor.h"
 #include "log.h"
@@ -58,6 +61,7 @@ static int read_scaled_channel(const char *base, const char *raw_channel,
     return 0;
 }
 
+/** @brief 读取并换算为整数 lux；处理值可用时优先使用处理值，否则尝试 raw/scale。 */
 int ocr_light_sensor_read(ocr_light_sensor_t *sensor, int *lux)
 {
     if (!sensor || !lux) return -1;

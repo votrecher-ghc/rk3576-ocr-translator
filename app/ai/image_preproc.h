@@ -1,3 +1,8 @@
+/**
+ * @file image_preproc.h
+ * CPU 图像预处理：按 stride/offset 读取已映射图像，双线性缩放或四点透视采样。
+ * 调用方负责持有源缓冲并包围 CPU 读访问的缓存同步；这些函数本身不提交 RGA 任务。
+ */
 #ifndef OCR_AI_IMAGE_PREPROC_H
 #define OCR_AI_IMAGE_PREPROC_H
 
@@ -16,6 +21,7 @@ static inline uint8_t ocr_ai_clip_u8(int value)
     return (uint8_t)(value < 0 ? 0 : value > 255 ? 255 : value);
 }
 
+/** @brief 根据像素格式与布局计算最后一个有效像素的位置，同时验证各平面参数。 */
 static inline int ocr_ai_buffer_required_size(const ocr_buffer_t *buf,
                                               size_t *required)
 {
@@ -99,6 +105,7 @@ static inline void ocr_ai_yuv_to_rgb(uint8_t y, uint8_t u, uint8_t v,
     rgb[2] = ocr_ai_clip_u8((298 * c + 516 * d + 128) >> 8);
 }
 
+/** @brief 按图像格式从映射内存读取一个像素，YUV 转 RGB 并处理实际行跨度。 */
 static inline int ocr_ai_read_rgb(const ocr_buffer_t *buf, int x, int y,
                                   float rgb[3])
 {
@@ -146,6 +153,8 @@ static inline int ocr_ai_read_rgb(const ocr_buffer_t *buf, int x, int y,
         size_t stride1 = buf->strides[1] ? buf->strides[1] : width;
         size_t offset1 = buf->plane_count >= 2 ? buf->offsets[1] : width * buf->height;
         size_t yy = offset0 + (size_t)y * stride0 + (size_t)x;
+        /* NV12 的一个 UV 对供相邻 2x2 像素共用：纵坐标除 2，横坐标向偶数取整。
+         * UV 字节顺序是 U,V；strides/offsets 用字节计，不能用 Y 指针继续顺序猜测。 */
         size_t uv = offset1 + (size_t)(y / 2) * stride1 + (size_t)(x & ~1);
         ocr_ai_yuv_to_rgb(data[yy], data[uv], data[uv + 1u], rgb);
         return 0;
@@ -154,11 +163,13 @@ static inline int ocr_ai_read_rgb(const ocr_buffer_t *buf, int x, int y,
         size_t stride1 = buf->strides[1] ? buf->strides[1] : width;
         size_t offset1 = buf->plane_count >= 2 ? buf->offsets[1] : width * buf->height;
         size_t yy = offset0 + (size_t)y * stride0 + (size_t)x;
+        /* NV16 只在水平方向降采样，UV 每一行都有，不能像 NV12 那样 y/2。 */
         size_t uv = offset1 + (size_t)y * stride1 + (size_t)(x & ~1);
         ocr_ai_yuv_to_rgb(data[yy], data[uv], data[uv + 1u], rgb);
         return 0;
     }
     case OCR_FMT_YUYV: {
+        /* YUYV 四字节一组 Y0,U,Y1,V；先定位两个像素共用的组，再按 x 奇偶取 Y。 */
         size_t pair = offset0 + (size_t)y * stride0 + (size_t)(x & ~1) * 2u;
         uint8_t yy = data[pair + ((x & 1) ? 2u : 0u)];
         ocr_ai_yuv_to_rgb(yy, data[pair + 1u], data[pair + 3u], rgb);
@@ -169,6 +180,7 @@ static inline int ocr_ai_read_rgb(const ocr_buffer_t *buf, int x, int y,
     }
 }
 
+/** @brief 对相邻四个像素进行双线性插值，供缩放和透视校正共用。 */
 static inline int ocr_ai_sample_rgb(const ocr_buffer_t *buf, float x, float y,
                                     float rgb[3])
 {
@@ -177,6 +189,8 @@ static inline int ocr_ai_sample_rgb(const ocr_buffer_t *buf, float x, float y,
     if (x > (float)(buf->width - 1u)) x = (float)(buf->width - 1u);
     if (y > (float)(buf->height - 1u)) y = (float)(buf->height - 1u);
 
+    /* 超出边界先夹紧；在最右/最下边界退化为重复边缘像素，不读取下一行之外。
+     * fx/fy 是落在四个邻点之间的小数位置，而不是缩放倍数。 */
     int x0 = (int)floorf(x);
     int y0 = (int)floorf(y);
     int x1 = x0 + 1 < (int)buf->width ? x0 + 1 : x0;
@@ -191,6 +205,8 @@ static inline int ocr_ai_sample_rgb(const ocr_buffer_t *buf, float x, float y,
         ocr_ai_read_rgb(buf, x1, y1, p11) != 0) {
         return -ENOTSUP;
     }
+    /* 双线性插值分两次线性插值：先分别求上下两行，再沿 y 混合结果。
+     * 三个通道独立处理，保留浮点值到最终写出时才舍入。 */
     for (int c = 0; c < 3; ++c) {
         float top = p00[c] + (p10[c] - p00[c]) * fx;
         float bottom = p01[c] + (p11[c] - p01[c]) * fx;
@@ -208,6 +224,7 @@ static inline int ocr_ai_validate_image(const ocr_buffer_t *buf)
     return 0;
 }
 
+/** @brief 在 CPU 上把源图缩放为连续 RGB 字节数组；目标内存由调用者提供。 */
 static inline int ocr_ai_resize_rgb(const ocr_buffer_t *buf, uint8_t *dst,
                                     int dst_width, int dst_height)
 {
@@ -216,6 +233,8 @@ static inline int ocr_ai_resize_rgb(const ocr_buffer_t *buf, uint8_t *dst,
     ret = ocr_ai_validate_image(buf);
     if (ret != 0) return ret;
 
+    /* 用像素中心映射：目标中心 y+0.5 缩放到源图，再减 0.5 变成源像素坐标。
+     * 这样尺寸不变时恰好映射回同一像素，避免边缘出现整体半像素偏移。 */
     for (int y = 0; y < dst_height; ++y) {
         float src_y = ((y + 0.5f) * buf->height / dst_height) - 0.5f;
         for (int x = 0; x < dst_width; ++x) {
@@ -232,6 +251,7 @@ static inline int ocr_ai_resize_rgb(const ocr_buffer_t *buf, uint8_t *dst,
     return 0;
 }
 
+/** @brief 根据文本框四角映射采样目标图像，用于校正倾斜文字区域。 */
 static inline int ocr_ai_warp_quad_rgb(const ocr_buffer_t *buf,
                                        const ocr_text_box_t *box,
                                        uint8_t *dst,
@@ -259,6 +279,8 @@ static inline int ocr_ai_warp_quad_rgb(const ocr_buffer_t *buf,
     dx1 = x1 - x2; dx2 = x3 - x2; dx3 = x0 - x1 + x2 - x3;
     dy1 = y1 - y2; dy2 = y3 - y2; dy3 = y0 - y1 + y2 - y3;
 
+    /* 求单位矩形到文本四边形的映射；平行四边形可退化成仿射变换。
+     * 后面从目标像素反查源坐标并插值，避免正向投影留下空洞。 */
     if (fabsf(dx3) < 1e-6f && fabsf(dy3) < 1e-6f) {
         g = h = 0.0f;
     } else {
@@ -278,6 +300,8 @@ static inline int ocr_ai_warp_quad_rgb(const ocr_buffer_t *buf,
         float v = (y + 0.5f) / dst_height;
         for (int x = 0; x < dst_width; ++x) {
             float u = (x + 0.5f) / dst_width;
+            /* 齐次坐标除以分母才得到源坐标；分母接近 0 表示映射退化。
+             * 输入四角必须按文本框周向顺序排列，不能随意交换两个顶点。 */
             float denominator = g * u + h * v + 1.0f;
             float rgb[3];
             if (fabsf(denominator) < 1e-6f) return -EINVAL;

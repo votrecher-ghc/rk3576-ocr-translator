@@ -1,4 +1,6 @@
 #!/bin/bash
+# 收集启动组件与 rootfs，按选定 overlay 模式准备 DTB，再生成分区镜像。
+# 完整 update.img 依赖外部 vendor 包装器；overlay 的合并方式决定启动时由谁加载它。
 # =====================================================================
 # 固件打包脚本 (野火 LubanCat3 / RK3576)
 # 功能: 打包 boot.img + rootfs.img + resource (dtbo) 为完整固件

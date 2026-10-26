@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# 检测模型转换入口：准备 ONNX 和校准图像列表，配置 RK3576 量化后导出 RKNN。
+# 输出模型的输入预处理约定必须与 app/ai/ocr_det.c 保持一致。
 """
 将 PaddleOCR 文本检测模型 (ppocrv4_det) 转换为 RKNN 格式。
 

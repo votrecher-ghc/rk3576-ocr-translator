@@ -1,4 +1,6 @@
 #!/bin/bash
+# 在 vendor Buildroot 中构建根文件系统，并检查配置和部署输入是否齐全。
+# 应用、模型和外部内核模块来自前序构建结果，由 post-build 阶段安装到目标文件系统。
 # Build the root filesystem with the Rockchip/LubanCat vendor Buildroot tree.
 set -euo pipefail
 

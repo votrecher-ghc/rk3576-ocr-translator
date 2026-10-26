@@ -1,6 +1,9 @@
 /**
  * @file rga_stabilizer.c
  * @brief 固定裁剪窗口的 RGA 防抖补偿实现。
+ *
+ * 电子防抖执行器：把目标位移转换为固定尺寸裁剪窗口，再由同步 RGA 裁剪/缩放到输出。
+ * 裁剪位置按色度采样对齐并限制在源图范围内；当前不执行任意小角度图像旋转。
  */
 #include "rga_stabilizer.h"
 #include "rga_api.h"
@@ -34,6 +37,7 @@ int ocr_rga_stab_update(ocr_rga_stabilizer_t *stab,
     return 0;
 }
 
+/** @brief 按固定放大比例和目标宽高比计算裁剪尺寸，避免输出被拉伸。 */
 static void fit_crop_to_destination(const ocr_buffer_t *src,
                                     const ocr_buffer_t *dst,
                                     float scale,
@@ -59,6 +63,7 @@ static void fit_crop_to_destination(const ocr_buffer_t *src,
     *crop_h = (uint32_t)lroundf(height);
 }
 
+/** @brief 限制并对齐裁剪窗口后同步执行 RGA；输入和输出在返回前都必须保持有效。 */
 int ocr_rga_stab_apply(ocr_rga_stabilizer_t *stab,
                        ocr_buffer_t *src, ocr_buffer_t *dst)
 {
@@ -102,6 +107,8 @@ int ocr_rga_stab_apply(ocr_rga_stabilizer_t *stab,
         return -2;
     }
 
+    /* max_x/max_y 是左上角的可移动范围，不是中心的最大偏移；中心位置是
+     * max_x/2、max_y/2。以中心为零补偿点，再减 dx/dy 得到反向裁剪移动。 */
     max_x = (int)src->width - (int)crop_w;
     max_y = (int)src->height - (int)crop_h;
 
@@ -114,6 +121,8 @@ int ocr_rga_stab_apply(ocr_rga_stabilizer_t *stab,
     crop_x = ocr_clamp_i(crop_x, 0, max_x);
     crop_y = ocr_clamp_i(crop_y, 0, max_y);
 
+    /* 限幅之后向偶数坐标下取整，使裁剪起点落在 UV 采样边界。
+     * 尺寸之前已同样对齐，因此不会出现起点合法但终点切开色度采样的问题。 */
     if (src->format == OCR_FMT_NV12) {
         crop_x &= ~1;
         crop_y &= ~1;

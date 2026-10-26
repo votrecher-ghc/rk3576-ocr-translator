@@ -5,6 +5,9 @@
  * @brief 线程原语封装：mutex/cond/semaphore/thread
  *
  * 基于 pthread 的轻量封装，提供统一命名与错误检查。
+ *
+ * 统一封装 pthread 和 POSIX 信号量，通常以 0 表示成功、负数表示错误。
+ * 超时等待另以 1 表示超时；条件变量必须在持锁时配合谓词循环使用，防止虚假唤醒。
  */
 
 #include <pthread.h>
@@ -42,6 +45,7 @@ static inline int ocr_cond_init(ocr_cond_t *c) {
 static inline int ocr_cond_destroy(ocr_cond_t *c) {
     return pthread_cond_destroy(c) == 0 ? 0 : -1;
 }
+/** @brief 调用时必须已持有 m；等待期间原子释放锁，返回前重新持锁并由调用方复查谓词。 */
 static inline int ocr_cond_wait(ocr_cond_t *c, ocr_mutex_t *m) {
     return pthread_cond_wait(c, m) == 0 ? 0 : -1;
 }
@@ -71,6 +75,7 @@ static inline int ocr_sem_init(ocr_sem_t *s, uint32_t init_val) {
 static inline int ocr_sem_destroy(ocr_sem_t *s) {
     return sem_destroy(s) == 0 ? 0 : -1;
 }
+/** @brief 等待一个信号量计数，信号中断时重试，成功后消费一个计数。 */
 static inline int ocr_sem_wait(ocr_sem_t *s) {
     int ret;
     do {

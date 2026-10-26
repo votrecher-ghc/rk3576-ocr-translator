@@ -1,3 +1,8 @@
+/**
+ * @file test_pipeline.c
+ * 主机线程集成测试：构造三段真实节点，投递带帧号的内存替身并等待逐级处理。
+ * 每级应完整看到所有帧，每帧最终只释放一次；不涉及摄像头、RGA 或显示硬件。
+ */
 /* Host integration test for the production threaded pipeline. */
 #include "pipeline.h"
 
@@ -11,12 +16,13 @@
 enum { FRAME_COUNT = 6 };
 
 typedef struct {
-    atomic_int calls;
-    atomic_uint_fast64_t seen_mask;
+    atomic_int calls; /**< 该测试节点处理回调的原子累计次数，用于等待并核对所有帧通过。 */
+    atomic_uint_fast64_t seen_mask; /**< 已见帧号位图，位 i 对应 frame_id=i；原子 OR 检查无丢帧/错误帧号。 */
 } stage_ctx_t;
 
 static atomic_int released;
 
+/** @brief 最终引用归零时记录释放次数并释放替身元数据，供测试发现泄漏或重复回收。 */
 static void release_frame(ocr_buffer_t *buffer, void *user_data)
 {
     (void)user_data;
@@ -24,6 +30,7 @@ static void release_frame(ocr_buffer_t *buffer, void *user_data)
     free(buffer);
 }
 
+/** @brief 记录本级看到的帧号并返回 0，让生产节点按正常逻辑继续转发同一输入。 */
 static int process_frame(ocr_pipeline_node_t *node, ocr_buffer_t *buffer)
 {
     stage_ctx_t *stage = node->user_ctx;
@@ -34,6 +41,7 @@ static int process_frame(ocr_pipeline_node_t *node, ocr_buffer_t *buffer)
     return 0;
 }
 
+/** @brief 以有限时间等待线程结果，避免调度尚未完成时立即断言，也避免测试无限阻塞。 */
 static int wait_for(atomic_int *value, int expected, int timeout_ms)
 {
     struct timespec delay = {.tv_nsec = 1000000};

@@ -1,6 +1,9 @@
 /**
  * @file temp_sensor.c
  * @brief ADT7410 温度读取实现
+ *
+ * 读取 IIO 温度属性，优先使用处理值，必要时根据 raw/offset/scale 换算。
+ * 对外统一采用毫摄氏度，风扇温度阈值必须使用相同单位。
  */
 #include "temp_sensor.h"
 #include "log.h"
@@ -37,6 +40,7 @@ int ocr_temp_sensor_init(ocr_temp_sensor_t *sensor, const char *sysfs_path)
     return 0;
 }
 
+/** @brief 统一输出毫摄氏度，使用浮点中间值检查溢出后再转换成整数。 */
 int ocr_temp_sensor_read(ocr_temp_sensor_t *sensor, int *temp_mdeg)
 {
     if (!sensor || !temp_mdeg) return -1;

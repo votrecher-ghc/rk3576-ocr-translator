@@ -1,6 +1,9 @@
 /**
  * @file imx415_ctrl.c
  * @brief IMX415 摄像头控制实现
+ *
+ * 通过摄像头 V4L2 control 接口设置曝光、增益和自动曝光。
+ * 这些控制只调整已打开设备的参数，不分配图像缓冲，也不负责启动采集流。
  */
 #include "imx415_ctrl.h"
 #include "log.h"

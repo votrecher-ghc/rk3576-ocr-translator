@@ -1,4 +1,9 @@
 /**
+ * @file test_buffer.c
+ * 验证应用层缓冲引用、映射、图像布局和池回收时序。
+ * 测试 fd 为主机替身，只验证资源管理逻辑，不验证真实 DMA 传输或设备缓存一致性。
+ */
+/**
  * Production tests for app/pipeline/buffer.c and buffer_pool.c.
  * These tests use /dev/zero as a hardware-independent, mmap-capable fd.
  */
@@ -22,18 +27,18 @@
 #define REF_ITERATIONS 10000
 
 typedef struct {
-    atomic_int calls;
-    ocr_buffer_t *last_buffer;
+    atomic_int calls; /**< 释放回调被执行的原子计数，验证最后一次引用归零只触发一次。 */
+    ocr_buffer_t *last_buffer; /**< 回调记录的最后缓冲地址，用于身份断言，不新增引用或接管内存。 */
 } release_probe_t;
 
 typedef struct {
-    ocr_buffer_t *buffer;
+    ocr_buffer_t *buffer; /**< 借给引用压力测试线程的共享缓冲；主测试保留原引用直到所有线程 join。 */
 } ref_worker_ctx_t;
 
 typedef struct {
-    ocr_buffer_pool_t *pool;
-    atomic_int calls;
-    int state_seen;
+    ocr_buffer_pool_t *pool; /**< 借用的受测池，用于在回收通知中读取槽状态；回调本就处于池锁内。 */
+    atomic_int calls; /**< 整池回收通知的原子调用次数，验证回收次数和时序。 */
+    int state_seen; /**< 回收通知当时观察到的 slot_state，预期仍为 IN_USE，随后才发布 FREE。 */
 } recycle_probe_t;
 
 static int open_test_fd(void)
@@ -61,6 +66,7 @@ static void *ref_worker(void *arg)
     return NULL;
 }
 
+/** @brief 验证并发增减引用、最终回调只触发一次，以及重复释放被拒绝。 */
 static void test_reference_lifecycle(void)
 {
     ocr_buffer_t buffer;
@@ -99,6 +105,7 @@ static void test_reference_lifecycle(void)
     puts("[PASS] reference lifecycle");
 }
 
+/** @brief 以主机文件映射检查重复映射和解除映射的生命周期。 */
 static void test_mmap_lifecycle(void)
 {
     ocr_buffer_t buffer;
@@ -123,6 +130,7 @@ static void test_mmap_lifecycle(void)
     puts("[PASS] mmap lifecycle");
 }
 
+/** @brief 验证多平面偏移、stride 及越界布局，确保非法图像不能注册为有效布局。 */
 static void test_image_layout_validation(void)
 {
     ocr_buffer_t buffer;
@@ -165,6 +173,7 @@ static int recycle_probe_callback(ocr_buffer_t *buffer, void *user_data)
     return 0;
 }
 
+/** @brief 在回收通知中观察池状态，验证通知发生在发布 FREE 之前。 */
 static void test_pool_recycle_notification_order(void)
 {
     ocr_buffer_pool_t pool;
@@ -203,6 +212,7 @@ static void register_pool_buffers(ocr_buffer_pool_t *pool, int *fds, int count)
     }
 }
 
+/** @brief 模拟多个使用者持有同一缓冲，最后一个引用释放前不能再次 acquire。 */
 static void test_pool_reference_recycling(void)
 {
     ocr_buffer_pool_t pool;

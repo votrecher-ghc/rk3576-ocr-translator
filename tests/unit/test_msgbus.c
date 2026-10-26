@@ -1,3 +1,8 @@
+/**
+ * @file test_msgbus.c
+ * 验证消息先进先出、满队列拒绝、空队列超时和 eventfd 可读状态。
+ * 队列排空后通知计数也应排空，防止接收线程持续被过期通知唤醒。
+ */
 /* Unit tests for the production eventfd-backed message bus. */
 
 #include "msgbus.h"

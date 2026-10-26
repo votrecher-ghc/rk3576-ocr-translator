@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
+/**
+ * @file iio_ap3216c.c
+ * AP3216C 光学传感器驱动：注册照度、接近和红外三个 IIO 直接读取通道。
+ * ALS 原始计数需配合当前量程 scale 换算成 lux；PS/IR 必须先检查溢出位再提取有效数据。
+ */
 /*
  * AP3216C ambient-light, proximity and infrared sensor driver
  *
@@ -66,8 +71,8 @@
 #define AP3216C_INT_CLEAR_AUTOMATIC            0x00
 
 struct ap3216c_data {
-	struct i2c_client *client;
-	struct mutex lock;
+	struct i2c_client *client; /**< 借用 I2C core 的设备对象，确定总线/地址并用于 dev 日志，不自行释放。 */
+	struct mutex lock; /**< 保护寄存器与高低字节配对读取，避免并发读写打乱一次采样的锁存顺序。 */
 };
 
 /* Resolution in micro-lux per ADC count for ALS_CONFIG[5:4]. */
@@ -82,6 +87,7 @@ static const int ap3216c_als_scale_micro[] = {
  * The caller serializes register access with data->lock. A register read uses
  * a write message for the register address followed by a repeated-start read.
  */
+/* 调用者先持有设备锁；使用两条 I2C 消息完成寄存器寻址与读取。 */
 static int ap3216c_read_reg_locked(struct ap3216c_data *data, u8 reg, u8 *value)
 {
 	struct i2c_client *client = data->client;
@@ -103,6 +109,9 @@ static int ap3216c_read_reg_locked(struct ap3216c_data *data, u8 reg, u8 *value)
 	};
 	int ret;
 
+	/* msgs[0] 写寄存器地址，msgs[1] 从同一地址 repeated-start 读取。
+	 * i2c_transfer 返回完成的消息条数，不是字节数；只完成 1 条也必须报错，
+	 * 否则未读出的 value 可能被当成有效传感器数据返回。 */
 	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
 	if (ret < 0)
 		return ret;
@@ -144,6 +153,8 @@ static int ap3216c_read_pair_locked(struct ap3216c_data *data,
 {
 	int ret;
 
+	/* 低字节先读使配套高字节锁存，两个读取在调用方同一把设备锁内完成。
+	 * 顺序颠倒或允许其他读取插入，可能拼出分别来自两次采样的高低字节。 */
 	ret = ap3216c_read_reg_locked(data, low_reg, low);
 	if (ret)
 		return ret;
@@ -151,6 +162,7 @@ static int ap3216c_read_pair_locked(struct ap3216c_data *data,
 	return ap3216c_read_reg_locked(data, high_reg, high);
 }
 
+/* 组合高低寄存器得到照度原始计数，不在这里乘量程系数。 */
 static int ap3216c_read_als_locked(struct ap3216c_data *data, int *value)
 {
 	u8 low;
@@ -166,6 +178,7 @@ static int ap3216c_read_als_locked(struct ap3216c_data *data, int *value)
 	return 0;
 }
 
+/* 拒绝带红外溢出标记的数据，再拼接非连续的有效位。 */
 static int ap3216c_read_ir_locked(struct ap3216c_data *data, int *value)
 {
 	u8 low;
@@ -185,6 +198,7 @@ static int ap3216c_read_ir_locked(struct ap3216c_data *data, int *value)
 	return 0;
 }
 
+/* 先检查环境红外溢出，再去掉状态位并拼接接近原始值。 */
 static int ap3216c_read_ps_locked(struct ap3216c_data *data, int *value)
 {
 	u8 low;
@@ -204,6 +218,7 @@ static int ap3216c_read_ps_locked(struct ap3216c_data *data, int *value)
 	return 0;
 }
 
+/* 从 ALS 量程字段查出分辨率，按 IIO 整数加微小数形式返回 lux/计数。 */
 static int ap3216c_read_als_scale_locked(struct ap3216c_data *data,
 					 int *val, int *val2)
 {
@@ -295,6 +310,7 @@ static int ap3216c_set_mode_locked(struct ap3216c_data *data, u8 mode)
 	return ap3216c_write_reg_locked(data, AP3216C_REG_SYSTEM_CONFIG, mode);
 }
 
+/* 复位芯片并设置 ALS/PS/IR 参数，启动后等待首个有效采样周期。 */
 static int ap3216c_chip_init(struct ap3216c_data *data)
 {
 	u8 config;

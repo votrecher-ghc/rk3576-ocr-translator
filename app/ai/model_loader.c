@@ -3,6 +3,9 @@
 /**
  * @file model_loader.c
  * @brief Model registry and on-disk change detection.
+ *
+ * 模型文件登记与更新检测：记录路径、大小和修改时间，供上层决定何时重新加载。
+ * 本模块不创建 RKNN 上下文，查询结果属于 loader，销毁或修改登记后不应继续引用。
  */
 #include "model_loader.h"
 #include "timestamp.h"
@@ -51,6 +54,7 @@ static int validate_regular_file(const char *path, struct stat *st)
     return 0;
 }
 
+/** @brief 支持绝对路径或与模型目录组合的相对路径，拒绝路径截断。 */
 static int build_model_path(const ocr_model_loader_t *loader,
                             const char *path, char *out, size_t out_size)
 {
@@ -90,6 +94,7 @@ int model_loader_init(ocr_model_loader_t *loader, const char *model_dir)
     return 0;
 }
 
+/** @brief 验证普通模型文件并记录元数据，后续更新检查比较同一登记项。 */
 int model_loader_register(ocr_model_loader_t *loader, ocr_model_type_t type,
                           const char *path, const char *version)
 {
@@ -147,6 +152,7 @@ const ocr_model_entry_t *model_loader_query(ocr_model_loader_t *loader,
     return NULL;
 }
 
+/** @brief 只报告文件大小或修改时间变化，不在这里替换正在运行的模型。 */
 int model_loader_check_update(ocr_model_loader_t *loader,
                               ocr_model_type_t type)
 {

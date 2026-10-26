@@ -3,6 +3,9 @@
 /**
  * @file storage_mgr.h
  * @brief 存储管理：statfs 检查容量，>阈值按最旧优先删除
+ *
+ * 存储容量管理：读取文件系统使用率，按日期顺序清理归档直到达到目标占用率。
+ * 递归删除通过目录 fd 定位并拒绝跟随符号链接，清理范围限定为识别出的日期归档目录。
  */
 
 #include <stdint.h>
@@ -10,7 +13,7 @@
 /** 存储管理器上下文 */
 typedef struct {
     char root_dir[512];  /* 归档根目录 */
-    int  max_percent;    /* 容量告警阈值（百分比，如 90） */
+    int  max_percent; /**< 配置的占用率阈值，百分比；check 只报告使用率，何时清理由上层决定。 */
 } ocr_storage_mgr_t;
 
 /**

@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
+ * 摄像头 overlay 连接 IMX415、CSI 接收与 ISP 的 media graph 端点。
+ * 各 remote-endpoint 必须与 vendor base DTS 对应，启用节点本身不等于完成采集链路配置。
+ */
+/*
  * imx415-csi2.dtso - IMX415摄像头CSI2 DTS Overlay
  *
  * 描述: IMX415摄像头传感器通过MIPI CSI2连接到RK3576。

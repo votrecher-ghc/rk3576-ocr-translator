@@ -1,4 +1,8 @@
-/** @file capture_session.c @brief Synchronous photo OCR/archive workflow. */
+/** @file capture_session.c @brief Synchronous photo OCR/archive workflow.
+ *
+ * 按键拍照会话：引用最新采集帧 -> CPU 读同步 -> 检测/识别/翻译 -> JPEG 和文本归档。
+ * busy 原子标志避免会话重入；结束时配对结束缓存同步并释放帧，失败路径也必须归还资源。
+ */
 #include "capture_session.h"
 #include "zerocopy.h"
 #include "log.h"
@@ -16,6 +20,7 @@ typedef struct {
     jmp_buf jump;
 } jpeg_error_ctx_t;
 
+/** @brief 将 libjpeg 致命错误转回本函数的清理路径，避免默认处理直接终止整个进程。 */
 static void jpeg_error_exit(j_common_ptr cinfo)
 {
     jpeg_error_ctx_t *error = (jpeg_error_ctx_t *)cinfo->err;
@@ -40,6 +45,7 @@ static void yuv_to_rgb(uint8_t y, uint8_t u, uint8_t v, uint8_t rgb[3])
     rgb[2] = clamp_u8((298 * c + 516 * d + 128) >> 8);
 }
 
+/** @brief 按源图实际 stride 和 plane offset 生成一行 RGB，供 JPEG 编码逐行消费。 */
 static int make_rgb_row(const ocr_buffer_t *buf, uint32_t row, uint8_t *rgb)
 {
     const uint8_t *base = buf->mmap_addr;
@@ -94,6 +100,7 @@ static int make_rgb_row(const ocr_buffer_t *buf, uint32_t row, uint8_t *rgb)
     return -2;
 }
 
+/** @brief 只分配一行 RGB 临时内存进行 JPEG 编码；调用者负责包围源图的 CPU 读同步。 */
 static int encode_jpeg(ocr_buffer_t *buf, const char *path, int quality)
 {
     if (!buf || !path || !*path || buf->width == 0 || buf->height == 0) return -1;
@@ -186,10 +193,13 @@ static void append_line(char *dst, size_t capacity, const char *line)
                    line ? line : "");
 }
 
+/** @brief 通过原子 busy 标志串行执行一次拍照会话，所有退出路径最终释放所持帧。 */
 int ocr_capture_session_trigger(ocr_capture_session_t *sess)
 {
     if (!sess) return -1;
     int expected = 0;
+    /* CAS 同时完成“检查空闲”和“设忙”，避免两个触发者都先读到 0 再进入。
+     * 它只防本会话重入；与实时 OCR 的模型互斥由 main 的运行模式装配保证。 */
     if (!atomic_compare_exchange_strong(&sess->busy, &expected, 1)) {
         LOG_W("capture session is already busy");
         return 1;
@@ -209,6 +219,9 @@ int ocr_capture_session_trigger(ocr_capture_session_t *sess)
     memset(&entry, 0, sizeof(entry));
 
     sess->state = CAPTURE_SESSION_CAPTURING;
+    /* 拍照固定住当前最新的原始采集帧 A，不是后续不断变化的 latest 指针。
+     * 新帧到来可替换缓存引用，但本会话的引用会阻止这块 A 重新 QBUF。
+     * JPEG、检测和识别因而使用同一幅图像，不会中途被摄像头覆盖。 */
     frame = ocr_v4l2_get_latest(sess->capture);
     if (!frame) goto done;
     if (frame->fd >= 0) {
@@ -216,6 +229,8 @@ int ocr_capture_session_trigger(ocr_capture_session_t *sess)
             result = -3;
             goto done;
         }
+        /* 只在 START 真正成功后记录配对义务，失败时 done 不应多发一个 END。
+         * 与实时 OCR 路径不同，这里检查同步错误并中止本次会话。 */
         sync_started = 1;
     }
 
@@ -224,6 +239,8 @@ int ocr_capture_session_trigger(ocr_capture_session_t *sess)
     snprintf(entry.src_lang, sizeof(entry.src_lang), "%s", sess->src_lang);
     snprintf(entry.tgt_lang, sizeof(entry.tgt_lang), "%s", sess->tgt_lang);
 
+    /* 先保存此帧原图，再执行耗时推理。过程中持续持有 A，可能暂时减少摄像头
+     * 可轮转缓冲数量；这些调用同步完成，不会把 frame 借给后台异步任务。 */
     sess->state = CAPTURE_SESSION_SAVING;
     if (encode_jpeg(frame, entry.image_path, sess->jpeg_quality) != 0) {
         result = -3;
@@ -288,6 +305,9 @@ int ocr_capture_session_trigger(ocr_capture_session_t *sess)
     result = 0;
 
 done:
+    /* 所有错误路径统一收尾：先结束 CPU 访问，再归还帧引用，最后释放临时结果。
+     * 必须 END 在 unref 前，因为 unref 可能触发 QBUF，让摄像头立即重写内存。
+     * 若前面已有失败，END 的失败不覆盖原始错误，便于保留真正的失败阶段。 */
     if (sync_started && ocr_zerocopy_sync(frame->fd, 1) != 0 && result == 0)
         result = -8;
     if (frame) (void)ocr_buffer_unref(frame);
@@ -299,10 +319,12 @@ done:
     free(translated);
     free(texts);
     sess->state = result == 0 ? CAPTURE_SESSION_DONE : CAPTURE_SESSION_IDLE;
+    /* 全部清理完才开放下一次触发，避免新会话与上次收尾共用状态/工作区。 */
     atomic_store(&sess->busy, 0);
     return result;
 }
 
+/** @brief 只在拍照键按下时触发同步会话，释放事件不重复拍照。 */
 void ocr_capture_session_on_key(ocr_key_event_t event, ocr_key_state_t state,
                                 void *user)
 {

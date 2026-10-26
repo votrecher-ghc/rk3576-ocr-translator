@@ -1,4 +1,8 @@
-/** @file translator.c @brief Contract-checked greedy RKNN translation. */
+/** @file translator.c @brief Contract-checked greedy RKNN translation.
+ *
+ * 离线翻译：校验 manifest 和静态 encoder/decoder 张量约定，再执行逐 token 贪心解码。
+ * encoder 先生成状态；decoder 反复读取目标前缀和状态，直到遇到 EOS 或达到长度上限。
+ */
 #include "translator.h"
 #include "log.h"
 
@@ -20,6 +24,7 @@ static int manifest_string_equals(const cJSON *root, const char *key,
            strcmp(item->valuestring, expected) == 0;
 }
 
+/** @brief 检查模型约定、分词器版本、词表容量及语言对，拒绝混用不匹配资产。 */
 int translator_validate_manifest(const char *manifest_path,
                                  const char *src_lang,
                                  const char *tgt_lang)
@@ -114,6 +119,7 @@ static int validate_special_tokens(const ocr_tokenizer_t *tok,
     return 0;
 }
 
+/** @brief 确认静态序列长度、token 类型、encoder 状态和 decoder 输入形状相容。 */
 static int validate_contract(ocr_translator_t *trs)
 {
     if (trs->encoder.input_num != 1 || trs->encoder.output_num != 1) {
@@ -131,6 +137,8 @@ static int validate_contract(ocr_translator_t *trs)
         return -EINVAL;
     }
 
+    /* 不按输入索引硬编码 tokens/state：导出工具可能调整节点顺序。
+     * 依赖“整数且形状为 [1,L]”识别 token 输入，两个都像 token 时拒绝猜测。 */
     trs->decoder_token_input = -1;
     trs->decoder_state_input = -1;
     for (int i = 0; i < trs->decoder.input_num; ++i) {
@@ -151,6 +159,8 @@ static int validate_contract(ocr_translator_t *trs)
         return -EINVAL;
     }
 
+    /* encoder 返回 float 视图，普通 set_input 可转换到 decoder 所需存储类型，
+     * 但元素形状和排列仍必须一致；相同字节数并不足以证明两端状态兼容。 */
     const ocr_rknn_tensor_t *state_input =
         &trs->decoder.inputs[trs->decoder_state_input];
     if (!is_convertible_state_type(state_input->type) ||
@@ -233,6 +243,7 @@ static int set_token_input(ocr_rknn_t *model, int input_index,
                                  RKNN_TENSOR_INT32, RKNN_TENSOR_UNDEFINED);
 }
 
+/** @brief 先运行 encoder，再以 BOS 开始逐步选择最大有限 logit，遇到 EOS 结束。 */
 int translator_translate(ocr_translator_t *trs, const char *src,
                          char *tgt, int tgt_size)
 {
@@ -247,6 +258,8 @@ int translator_translate(ocr_translator_t *trs, const char *src,
     }
     tgt[0] = '\0';
 
+    /* 静态 ONNX/RKNN 输入长度固定。分词返回实际长度后，把剩余位置补 PAD，
+     * 不把未初始化的栈内容作为 token 传入模型。 */
     int src_len = tokenizer_encode(&trs->src_tokenizer, src, src_ids,
                                    trs->src_capacity);
     if (src_len < 0) return src_len;
@@ -269,9 +282,13 @@ int translator_translate(ocr_translator_t *trs, const char *src,
     for (int i = 0; i < trs->tgt_capacity; ++i) {
         tgt_ids[i] = trs->tgt_tokenizer.pad_id;
     }
+    /* 目标从 BOS 开始，tgt_len 是已有前缀长度，不是将要输出的 token 索引。
+     * 这里借用 encoder 输出直到整句结束，期间不能重新运行同一 encoder 上下文。 */
     tgt_ids[0] = trs->tgt_tokenizer.bos_id;
     int tgt_len = 1;
 
+    /* 每轮输入完整的定长目标前缀，未生成的位置仍为 PAD。
+     * 这是静态前缀解码，当前没有增量 KV cache 或 beam search。 */
     while (tgt_len < trs->max_len) {
         ret = set_token_input(&trs->decoder, trs->decoder_token_input,
                               tgt_ids, trs->tgt_capacity);
@@ -297,6 +314,8 @@ int translator_translate(ocr_translator_t *trs, const char *src,
         }
 
         int vocab_size = trs->tgt_tokenizer.vocab_size;
+        /* 支持仅返回下一步 [1,1,V]，或返回整个前缀各步 [1,T,V] 的模型。
+         * 后者取已有前缀最后一步 tgt_len-1 的分数，偏移量按 V 个 float 计算。 */
         int output_step = trs->decoder_steps == 1 ? 0 : tgt_len - 1;
         const float *logits = (const float *)decoder_output +
                               (size_t)output_step * (size_t)vocab_size;
@@ -310,6 +329,8 @@ int translator_translate(ocr_translator_t *trs, const char *src,
             }
         }
         if (best_id < 0) return -EDOM;
+        /* 贪心解码只保留当前最大项，不维护其他候选分支。EOS 也写入序列，
+         * tokenizer_decode 遇到它就停止，BOS/PAD 则跳过，不显示在最终文本中。 */
         tgt_ids[tgt_len++] = best_id;
         if (best_id == trs->tgt_tokenizer.eos_id) break;
     }

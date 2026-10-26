@@ -3,6 +3,9 @@
 /**
  * @file drm_fb.h
  * @brief DRM framebuffer：DMA-BUF 绑定（drmPrimeFDToHandle + drmModeAddFB2）
+ *
+ * 把 DMA-BUF 导入为 GEM handle，并根据像素格式、stride 和 offset 创建 framebuffer。
+ * 导入不复制像素，源 fd 只是借用；翻页接口等待新帧切换完成，供调用方安全释放上一帧。
  */
 
 #include "buffer.h"
@@ -10,16 +13,16 @@
 
 /** DRM framebuffer 句柄 */
 typedef struct {
-    uint32_t fb_id;     /* DRM framebuffer ID */
-    uint32_t handle;    /* GEM handle（drmPrimeFDToHandle 获得） */
-    uint32_t handles[4];/* 每个格式平面的 GEM handle（NV12 两平面可相同） */
-    uint32_t pitches[4];/* 每平面 stride */
-    uint32_t offsets[4];/* 每平面在 DMA-BUF 中的偏移 */
-    uint32_t plane_count;/* 格式平面数 */
-    uint32_t width;     /* 宽 */
-    uint32_t height;    /* 高 */
-    ocr_pixel_format_t format; /* 像素格式 */
-    int      dmabuf_fd; /* 绑定的 DMA-BUF fd */
+    uint32_t fb_id; /**< AddFB2 创建的 framebuffer 对象 ID，RmFB 归还；0 表示尚未建立。 */
+    uint32_t handle; /**< 此 DRM fd 上 PRIME 导入的 GEM handle；本模块关闭，区别于可跨进程传的 fd。 */
+    uint32_t handles[4]; /**< 各逻辑平面使用的 GEM handle；单 DMA-BUF 的 NV12 Y/UV 复用同一个值。 */
+    uint32_t pitches[4]; /**< 各平面一行占用字节数，含 padding；传给 AddFB2，不是 RGA 像素 wstride。 */
+    uint32_t offsets[4]; /**< 各平面相对共享存储起点的字节偏移，NV12 的 UV 通常从 Y 分配区之后开始。 */
+    uint32_t plane_count; /**< 像素格式所需的有效逻辑平面数，不表示有几块独立 DMA-BUF。 */
+    uint32_t width; /**< 有效图像宽度，像素；不包含行尾填充。 */
+    uint32_t height; /**< 有效图像高度，像素；用于校验与当前显示模式匹配。 */
+    ocr_pixel_format_t format; /**< 项目像素格式，用于转换 DRM FourCC 和推导平面布局。 */
+    int      dmabuf_fd; /**< 借用输出池的 DMA-BUF fd，FB 销毁不 close；-1 表示未绑定。 */
 } ocr_drm_fb_t;
 
 /**
